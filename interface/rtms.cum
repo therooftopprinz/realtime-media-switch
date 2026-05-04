@@ -1,0 +1,138 @@
+using bytes            = buffer<u8, 2048>;
+using optional_bytes   = optional<bytes>;
+using session          = array<u8, 16>;
+using optional_session = optional<session>;
+
+enumeration status_code
+{
+    OK,                     // all response
+    NOT_FOUND,              // join_response, leave_response
+    META_MISMATCH,          // join_response
+};
+
+enumeration reason_code
+{
+    UNRECOGNIZED_TRANSPORT, // identity_request
+    CHALLENGE_FAILURE,      // identity_request
+    SESSION_NOT_AVAILABLE,  // identity_request
+    EXPIRATION_REFRESH,     // identity_request
+    NOT_JOINED,             // ignored_indication
+    NOT_AUTHENTICATED       // ignored_indication
+};
+
+sequence heartbeat
+{};
+
+enumeration challenge_type
+{
+    HMAC_SHA256
+};
+
+sequence identity_request
+{
+    u16            req_id;
+    reason_code    reason;
+    challenge_type type;
+    bytes          challenge_request;
+    session        new_session;
+};
+
+sequence identity_response
+{
+    u16            req_id;
+    string         username;
+    bytes          challenge_response;
+    bytes          session_to_use;
+};
+
+sequence channel_limits
+{
+    u32            pkt_rate_limit;
+    u16            max_payload_size;
+};
+
+using optional_channel_limits = optional<channel_limits>;
+
+sequence create_request
+{
+    u16            req_id;
+    string         name;
+    string         metadata;
+    channel_limits limits;
+};
+
+sequence create_response
+{
+    u16            req_id;
+    u64            channel_id;
+    status_code    code;
+};
+
+sequence join_request
+{
+    u16            req_id;
+    u64            channel_id;
+    string         metadata;
+};
+
+sequence join_response
+{
+    u16                     req_id;
+    status_code             code;
+    optional_channel_limits limits;
+};
+
+sequence leave_request
+{
+    u16    req_id;
+    u64    channel_id;
+};
+
+sequence leave_response
+{
+    u16    req_id;
+};
+
+sequence stream_data
+{
+    string from_username;
+    u64    channel_id;
+    bytes  payload;
+};
+
+sequence stream_report
+{
+    u64    channel_id;
+    u64    received_pkt;
+    u64    dropped_internally_pkt;
+};
+
+sequence ignored_indication
+{
+    reason_code reason;
+    string      message;
+};
+
+choice messages
+{
+    heartbeat,
+    identity_request,
+    identity_response,
+    create_request,
+    create_response,
+    join_request,
+    join_response,
+    leave_request,
+    leave_response,
+    stream_data,
+    stream_report,
+    ignored_indication
+};
+
+sequence rtms
+{
+    u8             protocol_version;
+    u64            sender_ts_us;
+    optional_bytes session;
+    messages       message;
+};

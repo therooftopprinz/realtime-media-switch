@@ -1,0 +1,21 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 16,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "switch → ../switch_build",
+      "binaryDir": "${sourceDir}/../switch_build"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
+    }
+  ]
+}
