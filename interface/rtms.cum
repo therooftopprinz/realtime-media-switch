@@ -1,6 +1,6 @@
-using bytes            = buffer<u8, 2048>;
+using bytes            = dynamic<u8, 2048>;
 using optional_bytes   = optional<bytes>;
-using session          = array<u8, 16>;
+using session          = static<u8, 16>;
 using optional_session = optional<session>;
 
 enumeration status_code
@@ -56,7 +56,7 @@ using optional_channel_limits = optional<channel_limits>;
 sequence create_request
 {
     u16            req_id;
-    string         name;
+    string         channel_name;
     string         metadata;
     channel_limits limits;
 };
@@ -71,13 +71,14 @@ sequence create_response
 sequence join_request
 {
     u16            req_id;
-    u64            channel_id;
+    string         channel_name;
     string         metadata;
 };
 
 sequence join_response
 {
     u16                     req_id;
+    u64                     channel_id;
     status_code             code;
     optional_channel_limits limits;
 };

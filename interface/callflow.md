@@ -71,11 +71,13 @@ create_response
 
 join_request
 * client initiated
+* identifies channel by name (and metadata must match)
 * server shall remember client session in the channel
 
 join_response
 * server response
-* fails if channel_id doesn't exist
+* returns channel_id and optional limits on success
+* fails if channel name is unknown or metadata does not match the channel
 
 leave_request
 * client initiated

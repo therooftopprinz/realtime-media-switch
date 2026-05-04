@@ -2,15 +2,20 @@
 #define __CORE_SESSION_MANAGER_HPP__
 
 #include <algorithm>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 #include <protocol/rtms.hpp>
 
-#include <core/transport_context.hpp>
+#include <utils/transport_endpoint.hpp>
 
 namespace core
 {
+
+using transport_endpoint_key_t = utils::transport_endpoint_key_t;
+using transport_endpoint_hash = utils::transport_endpoint_hash;
 
 using session_id_t = cum::session;
 
@@ -39,8 +44,8 @@ struct session_id_equal_t
 
 struct session_data_s
 {
-    std::string username;
-    tctx_ptr_t transport_ctx;
+    std::string                             username;
+    std::optional<transport_endpoint_key_t> transport_key;
 };
 
 using session_data_ptr_t = std::shared_ptr<session_data_s>;
@@ -51,8 +56,8 @@ public:
     session_manager();
     ~session_manager();
 
-    session_data_ptr_t create_session(session_id_t const& p_session_id, tctx_ptr_t p_transport_ctx,
-                                      std::string const& p_username = {});
+    session_data_ptr_t create_session(session_id_t const& p_session_id, transport_endpoint_key_t p_transport_key,
+        std::string const& p_username = {});
     void delete_session(session_id_t const& p_session_id);
 
     session_data_ptr_t const& get_session(session_id_t const& p_session_id) const;

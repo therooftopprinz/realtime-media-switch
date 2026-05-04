@@ -64,7 +64,7 @@ std::size_t identity_manager::user_count() const
 bool identity_manager::verify_identity(cum::bytes const& p_challenge, cum::bytes const& p_answer,
                                        std::string const& p_username) const
 {
-    if (p_answer.size != utils::hmac_sha256_digest_bytes || p_challenge.size == 0)
+    if (p_answer.size() != utils::hmac_sha256_digest_bytes || p_challenge.size() == 0)
     {
         return false;
     }
@@ -78,11 +78,10 @@ bool identity_manager::verify_identity(cum::bytes const& p_challenge, cum::bytes
     std::string const& password = it->second;
     std::uint8_t computed[utils::hmac_sha256_digest_bytes]{};
 
-    utils::hmac_sha256(reinterpret_cast<std::uint8_t const*>(password.data()), password.size(),
-                       reinterpret_cast<std::uint8_t const*>(&p_challenge.data[0]), p_challenge.size, computed);
+    utils::hmac_sha256(reinterpret_cast<std::uint8_t const*>(password.data()), password.size(), p_challenge.data(),
+                       p_challenge.size(), computed);
 
-    return utils::hmac_sha256_digest_equals(computed, reinterpret_cast<std::uint8_t const*>(&p_answer.data[0]),
-                                           utils::hmac_sha256_digest_bytes);
+    return utils::hmac_sha256_digest_equals(computed, p_answer.data(), utils::hmac_sha256_digest_bytes);
 }
 
 } // namespace core

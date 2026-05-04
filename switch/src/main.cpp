@@ -1,8 +1,10 @@
 #include <cstdint>
 #include <algorithm>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <bfc/configuration_parser.hpp>
@@ -11,7 +13,7 @@
 
 #include <core/identity_manager.hpp>
 #include <core/rtms_switch.hpp>
-#include <transports/udp4_transport.hpp>
+#include <transport/udp_transport.hpp>
 #include <utils/logger.hpp>
 #include <utils/types.hpp>
 
@@ -96,12 +98,41 @@ bool parse_args(int argc, char* argv[], bfc::configuration_parser& cfg)
     return true;
 }
 
+/** If argv did not pass a non-empty cfg= path, probe well-known locations (e.g. sibling `build_switch` vs repo `switch/configuration`). */
+void resolve_default_config_path(bfc::configuration_parser& cfg)
+{
+    auto it = cfg.find("cfg");
+    if (it != cfg.end() && !unquote(it->second).empty())
+    {
+        return;
+    }
+
+    std::filesystem::path const cwd = std::filesystem::current_path();
+    static constexpr char const* candidates[] = {"../switch/configuration/config.cfg", "switch/configuration/config.cfg"};
+    for (char const* rel : candidates)
+    {
+        std::filesystem::path const candidate = cwd / rel;
+        std::error_code                ec;
+        if (!std::filesystem::is_regular_file(candidate, ec))
+        {
+            continue;
+        }
+
+        std::filesystem::path abs = std::filesystem::absolute(candidate).lexically_normal();
+        cfg.load_line(std::string("cfg=") + abs.string());
+        LOG(utils::INF, "config: no cfg= argument; loading default %s", abs.c_str());
+        return;
+    }
+}
+
 core::rtms_switch_config_t make_rtms_switch_config(bfc::configuration_parser const& cfg)
 {
     core::rtms_switch_config_t c;
 
-    c.client_idle_timeout_ms = cfg_u32(cfg, "switch.client_idle_timeout_ms")
-                                   .value_or(cfg_u32(cfg, "transport.udp4.client_idle_timeout_ms").value_or(10000));
+    c.client_idle_timeout_ms =
+        cfg_u32(cfg, "switch.client_idle_timeout_ms")
+            .value_or(cfg_u32(cfg, "transport.udp.client_idle_timeout_ms")
+                          .value_or(cfg_u32(cfg, "transport.udp4.client_idle_timeout_ms").value_or(10000)));
 
     c.identity_challenge_random_bytes = cfg_u32(cfg, "identity.challenge.bytes").value_or(32);
     c.identity_store                  = core::g_identity_manager.get();
@@ -122,27 +153,26 @@ core::rtms_switch_config_t make_rtms_switch_config(bfc::configuration_parser con
     return c;
 }
 
-core::udp_transport_config_t make_udp_listen_config(std::string p_host, std::uint16_t p_port,
-                                                    std::uint32_t p_client_idle_timeout_ms)
+transport::udp_transport_config_t make_udp_listen_config(std::string p_host, std::uint16_t p_port)
 {
-    core::udp_transport_config_t u;
-    u.host                   = std::move(p_host);
-    u.port                   = p_port;
-    u.client_idle_timeout_ms = p_client_idle_timeout_ms;
+    transport::udp_transport_config_t u;
+    u.host = std::move(p_host);
+    u.port = p_port;
     return u;
 }
 
-bool transport_is_udp4(bfc::configuration_parser const& cfg)
+bool transport_is_udp(bfc::configuration_parser const& cfg)
 {
     auto p = cfg_str(cfg, "transport.protocol");
     if (!p)
     {
         return true;
     }
-    return *p == "udp4";
+    return *p == "udp" || *p == "udp4" || *p == "udp6";
 }
 
-void load_identity_sources_from_config(bfc::configuration_parser const& cfg)
+void load_identity_sources_from_config(bfc::configuration_parser const& cfg,
+                                       std::optional<std::filesystem::path> identity_file_base)
 {
     std::uint32_t slot_count_u = cfg_u32(cfg, "identity_source.size").value_or(1);
     std::size_t const slot_cap = std::min<std::uint32_t>(std::max<std::uint32_t>(slot_count_u, 1u), 64u);
@@ -164,11 +194,17 @@ void load_identity_sources_from_config(bfc::configuration_parser const& cfg)
             continue;
         }
 
+        std::filesystem::path file_path(*path);
+        if (identity_file_base && !file_path.is_absolute())
+        {
+            file_path = *identity_file_base / file_path;
+        }
+
         utils::hcsv table;
-        table.load(*path);
+        table.load(file_path.string());
         if (table.size() < 2)
         {
-            LOG(utils::WRN, "identity: file %s not loaded or missing header/data", path->c_str());
+            LOG(utils::WRN, "identity: file %s not loaded or missing header/data", file_path.c_str());
             continue;
         }
 
@@ -182,13 +218,47 @@ void load_identity_sources_from_config(bfc::configuration_parser const& cfg)
             core::g_identity_manager->extend_identity(table);
         }
 
+        if (table.size() >= 2 && core::g_identity_manager->user_count() == 0)
+        {
+            LOG(utils::WRN,
+                "identity: %s parses but no users merged — header row must include columns named exactly username and "
+                "password",
+                file_path.c_str());
+        }
+
         std::size_t data_rows = table.size() > 1 ? table.size() - 1 : 0;
         LOG(utils::INF, "identity: merged %zu data row(s) from %s (users=%zu)", data_rows,
-            path->c_str(),
+            file_path.c_str(),
             core::g_identity_manager->user_count());
     }
 
     LOG(utils::INF, "identity: loaded %zu user(s)", core::g_identity_manager->user_count());
+}
+
+/** One UDP listen socket plus the TX/RX ring pair registered on `rtms_switch`. */
+struct udp_listen_bundle
+{
+    transport::transport_in_queue_t            tx_queue{};
+    transport::transport_out_queue_t           rx_queue{};
+    std::shared_ptr<transport::udp_transport> udp;
+};
+
+/** Binds UDP and wires queues to `p_switch`. `p_listener_slot` isolates flows (peer keys include listener id). */
+std::shared_ptr<udp_listen_bundle> attach_udp_listener(core::rtms_switch& p_switch,
+    utils::io_reactor& p_socket_reactor, utils::cv_reactor_t& p_cv_reactor,
+    core::rtms_switch_config_t const& p_sw_cfg, std::uint64_t p_listener_slot, std::string&& p_bind_host,
+    std::uint16_t p_bind_port, char const* p_log_summary)
+{
+    transport::udp_transport_config_t udp_cfg = make_udp_listen_config(std::move(p_bind_host), p_bind_port);
+    auto                               b       = std::make_shared<udp_listen_bundle>();
+    b->udp = std::make_shared<transport::udp_transport>(udp_cfg, p_socket_reactor, p_cv_reactor, b->tx_queue,
+        b->rx_queue);
+    p_switch.register_transport_rx(b->rx_queue, b->tx_queue, p_listener_slot,
+        transport::udp_bind_host_is_ipv6(udp_cfg.host));
+    b->udp->start();
+    LOG(utils::INF, "%s %s:%u (switch idle %llu ms)", p_log_summary, udp_cfg.host.c_str(),
+        static_cast<unsigned>(udp_cfg.port), static_cast<unsigned long long>(p_sw_cfg.client_idle_timeout_ms));
+    return b;
 }
 
 } // namespace
@@ -201,10 +271,17 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    auto config_file_it = configuration.find("cfg");
+    resolve_default_config_path(configuration);
+
+    std::optional<std::filesystem::path> identity_file_base;
+    auto                                    config_file_it = configuration.find("cfg");
     if (config_file_it != configuration.end())
     {
         LOG(utils::INF, "Loading config file: %s", config_file_it->second.c_str());
+        std::filesystem::path const cfg_named = std::filesystem::path(unquote(config_file_it->second));
+        std::filesystem::path const resolved_cfg =
+            cfg_named.is_absolute() ? cfg_named : std::filesystem::absolute(std::filesystem::current_path() / cfg_named);
+        identity_file_base = resolved_cfg.parent_path();
         configuration.load(config_file_it->second);
     }
 
@@ -214,20 +291,20 @@ int main(int argc, char* argv[])
         LOG(utils::INF, "    %s = %s", key.c_str(), value.c_str());
     }
 
-    utils::reactor_t reactor;
+    utils::io_reactor   reactor;
+    utils::cv_reactor_t cv_reactor;
 
     core::g_identity_manager = std::make_unique<core::identity_manager>();
-    load_identity_sources_from_config(configuration);
+    load_identity_sources_from_config(configuration, identity_file_base);
 
     core::rtms_switch_config_t sw_cfg = make_rtms_switch_config(configuration);
-    core::rtms_switch            sw(sw_cfg);
+    core::rtms_switch            sw(sw_cfg, cv_reactor);
 
-    std::vector<std::shared_ptr<core::udp_transport>> udp_transports;
+    /** Keeps UDP transport objects alive for process lifetime (local-relay vs public are separate instances). */
+    std::vector<std::shared_ptr<udp_listen_bundle>> udp_keepalive;
 
-    if (transport_is_udp4(configuration))
+    if (transport_is_udp(configuration))
     {
-        std::uint32_t const idle_ms = sw_cfg.client_idle_timeout_ms;
-
         auto const enabled = [&](char const* p_key)
         {
             return cfg_u32(configuration, p_key).value_or(0) != 0;
@@ -236,41 +313,52 @@ int main(int argc, char* argv[])
         bool const pub_en = enabled("transport.public.enabled");
         bool const loc_en = enabled("transport.local.enabled");
 
-        auto start_one = [&](std::string&& p_host, std::uint16_t p_port, char const* p_label)
+        std::uint64_t next_listener_slot{};
+
+        auto push_listener = [&](std::shared_ptr<udp_listen_bundle> p_b)
         {
-            core::udp_transport_config_t udp_cfg =
-                make_udp_listen_config(std::move(p_host), p_port, idle_ms);
-            auto u = std::make_shared<core::udp_transport>(udp_cfg, sw, reactor);
-            u->start();
-            udp_transports.emplace_back(u);
-            LOG(utils::INF, "UDP[%s] %s:%u (idle timeout %u ms)", p_label,
-                udp_cfg.host.c_str(), static_cast<unsigned>(udp_cfg.port), idle_ms);
+            udp_keepalive.push_back(std::move(p_b));
         };
 
-        if (pub_en)
-        {
-            start_one(cfg_str(configuration, "transport.public.interface").value_or("0.0.0.0"),
-                      cfg_u16(configuration, "transport.public.port").value_or(25001), "public");
-        }
+        // Local-relay UDP: trusted path — reverse proxy / WebSocket relay; not TLS-terminated here.
         if (loc_en)
         {
-            std::uint16_t const lp           = cfg_u16(configuration, "transport.local.port").value_or(25000);
-            start_one(cfg_str(configuration, "transport.local.interface").value_or("127.0.0.1"),
-                      lp,
-                      "local");
+            std::uint16_t const lp = cfg_u16(configuration, "transport.local.port").value_or(25000);
+            push_listener(attach_udp_listener(sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
+                cfg_str(configuration, "transport.local.interface").value_or("127.0.0.1"), lp,
+                "UDP[local-relay]"));
         }
 
-        if (udp_transports.empty())
+        // Public / Internet-facing: plain UDP until udp_tls_transport is implemented for this socket only.
+        if (pub_en)
         {
-            start_one(cfg_str(configuration, "transport.host").value_or("0.0.0.0"),
-                      cfg_u16(configuration, "transport.port").value_or(12345), "legacy");
+            push_listener(
+                attach_udp_listener(sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
+                    cfg_str(configuration, "transport.public.interface").value_or("0.0.0.0"),
+                    cfg_u16(configuration, "transport.public.port").value_or(25001), "UDP[public-internet]"));
+        }
+
+        // Single-port fallback only when neither role is enabled (backward compatibility).
+        if (udp_keepalive.empty())
+        {
+            push_listener(attach_udp_listener(sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
+                cfg_str(configuration, "transport.host").value_or("0.0.0.0"),
+                cfg_u16(configuration, "transport.port").value_or(12345), "UDP[legacy]"));
         }
     }
     else
     {
-        LOG(utils::WRN, "transport.protocol is not udp4; no endpoint started");
+        LOG(utils::WRN, "transport.protocol is not udp/udp4/udp6; no endpoint started");
     }
 
+    std::thread cv_thread([&]()
+        {
+            cv_reactor.run();
+        });
+
     reactor.run();
+
+    cv_reactor.stop();
+    cv_thread.join();
     return 0;
 }

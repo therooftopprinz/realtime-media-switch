@@ -12,9 +12,9 @@ namespace cum
 /
 ************************************************/
 
-using bytes = cum::buffer<u8, 2048>;
+using bytes = cum::vector<u8, 2048>;
 using optional_bytes = std::optional<bytes>;
-using session = array<u8, 16>;
+using session = cum::array<u8, 16>;
 using optional_session = std::optional<session>;
 enum status_code
 {
@@ -69,7 +69,7 @@ using optional_channel_limits = std::optional<channel_limits>;
 struct create_request
 {
     u16 req_id;
-    string name;
+    string channel_name;
     string metadata;
     channel_limits limits;
 };
@@ -84,13 +84,14 @@ struct create_response
 struct join_request
 {
     u16 req_id;
-    u64 channel_id;
+    string channel_name;
     string metadata;
 };
 
 struct join_response
 {
     u16 req_id;
+    u64 channel_id;
     status_code code;
     optional_channel_limits limits;
 };
@@ -350,7 +351,7 @@ inline void encode_per(const create_request& pIe, cum::per_codec_ctx& pCtx)
 {
     using namespace cum;
     encode_per(pIe.req_id, pCtx);
-    encode_per(pIe.name, pCtx);
+    encode_per(pIe.channel_name, pCtx);
     encode_per(pIe.metadata, pCtx);
     encode_per(pIe.limits, pCtx);
 }
@@ -359,7 +360,7 @@ inline void decode_per(create_request& pIe, cum::per_codec_ctx& pCtx)
 {
     using namespace cum;
     decode_per(pIe.req_id, pCtx);
-    decode_per(pIe.name, pCtx);
+    decode_per(pIe.channel_name, pCtx);
     decode_per(pIe.metadata, pCtx);
     decode_per(pIe.limits, pCtx);
 }
@@ -378,7 +379,7 @@ inline void str(const char* pName, const create_request& pIe, std::string& pCtx,
     size_t nOptional = 0;
     size_t nMandatory = 4;
     str("req_id", pIe.req_id, pCtx, !(--nMandatory+nOptional));
-    str("name", pIe.name, pCtx, !(--nMandatory+nOptional));
+    str("channel_name", pIe.channel_name, pCtx, !(--nMandatory+nOptional));
     str("metadata", pIe.metadata, pCtx, !(--nMandatory+nOptional));
     str("limits", pIe.limits, pCtx, !(--nMandatory+nOptional));
     pCtx = pCtx + "}";
@@ -431,7 +432,7 @@ inline void encode_per(const join_request& pIe, cum::per_codec_ctx& pCtx)
 {
     using namespace cum;
     encode_per(pIe.req_id, pCtx);
-    encode_per(pIe.channel_id, pCtx);
+    encode_per(pIe.channel_name, pCtx);
     encode_per(pIe.metadata, pCtx);
 }
 
@@ -439,7 +440,7 @@ inline void decode_per(join_request& pIe, cum::per_codec_ctx& pCtx)
 {
     using namespace cum;
     decode_per(pIe.req_id, pCtx);
-    decode_per(pIe.channel_id, pCtx);
+    decode_per(pIe.channel_name, pCtx);
     decode_per(pIe.metadata, pCtx);
 }
 
@@ -457,7 +458,7 @@ inline void str(const char* pName, const join_request& pIe, std::string& pCtx, b
     size_t nOptional = 0;
     size_t nMandatory = 3;
     str("req_id", pIe.req_id, pCtx, !(--nMandatory+nOptional));
-    str("channel_id", pIe.channel_id, pCtx, !(--nMandatory+nOptional));
+    str("channel_name", pIe.channel_name, pCtx, !(--nMandatory+nOptional));
     str("metadata", pIe.metadata, pCtx, !(--nMandatory+nOptional));
     pCtx = pCtx + "}";
     if (!pIsLast)
@@ -476,6 +477,7 @@ inline void encode_per(const join_response& pIe, cum::per_codec_ctx& pCtx)
     }
     encode_per(optionalmask, sizeof(optionalmask), pCtx);
     encode_per(pIe.req_id, pCtx);
+    encode_per(pIe.channel_id, pCtx);
     encode_per(pIe.code, pCtx);
     if (pIe.limits)
     {
@@ -489,6 +491,7 @@ inline void decode_per(join_response& pIe, cum::per_codec_ctx& pCtx)
     uint8_t optionalmask[1] = {};
     decode_per(optionalmask, sizeof(optionalmask), pCtx);
     decode_per(pIe.req_id, pCtx);
+    decode_per(pIe.channel_id, pCtx);
     decode_per(pIe.code, pCtx);
     if (check_optional(optionalmask, 0))
     {
@@ -510,8 +513,9 @@ inline void str(const char* pName, const join_response& pIe, std::string& pCtx, 
     }
     size_t nOptional = 0;
     if (pIe.limits) nOptional++;
-    size_t nMandatory = 2;
+    size_t nMandatory = 3;
     str("req_id", pIe.req_id, pCtx, !(--nMandatory+nOptional));
+    str("channel_id", pIe.channel_id, pCtx, !(--nMandatory+nOptional));
     str("code", pIe.code, pCtx, !(--nMandatory+nOptional));
     if (pIe.limits)
     {
