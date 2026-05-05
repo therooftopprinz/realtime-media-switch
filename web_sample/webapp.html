@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RTMS web sample</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 10px;
+      font-family: system-ui, sans-serif;
+      background: #f6f7f9;
+      color: #171717;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 120px;
+    }
+    .field.grow { flex: 2 1 200px; }
+    label.small { font-size: 11px; color: #555; font-family: ui-monospace, monospace; }
+    input[type="text"], input[type="password"], select {
+      padding: 8px 10px;
+      border: 1px solid #c8c9cc;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    button {
+      padding: 9px 16px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      background: #5c6cff;
+      color: #fff;
+    }
+    button.secondary { background: #4b5563; }
+    button.danger { background: #dc2626; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #statusLine {
+      font-size: 12px;
+      font-family: ui-monospace, monospace;
+      color: #333;
+      min-height: 1.2em;
+    }
+    .layout {
+      display: flex;
+      flex: 1 1 auto;
+      gap: 8px;
+      min-height: 320px;
+    }
+    main.workspace {
+      flex: 1 1 auto;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 10px;
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    aside.channels {
+      width: 200px;
+      flex: 0 0 auto;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    aside.channels h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .channel-list { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+    .channel-tab {
+      text-align: left;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      background: #f0f2f8;
+      color: inherit;
+      font-size: 13px;
+    }
+    .channel-tab.active { border-color: #5c6cff; background: #eef2ff; }
+    .bubble-list {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      border: 1px solid #eee;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fafafa;
+      margin-bottom: 8px;
+    }
+    .msg { margin: 6px 0; font-size: 14px; }
+    .msg .meta { font-size: 11px; color: #666; margin-bottom: 2px; }
+    .composer { display: flex; gap: 6px; }
+    .composer textarea {
+      flex: 1;
+      resize: vertical;
+      min-height: 44px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      padding: 8px;
+      font-family: inherit;
+      font-size: 14px;
+    }
+    .media-panel { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+    .video-slot {
+      position: relative;
+      background: #111;
+      border-radius: 6px;
+      overflow: hidden;
+      max-width: 100%;
+    }
+    .video-slot video {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 240px;
+    }
+    .video-slot.maximized { width: min(920px, 100%); flex: none; margin: auto; z-index: 2; }
+    .video-slot.maximized video { max-height: 560px; }
+    .lists { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+    .list-box {
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 6px;
+      min-height: 80px;
+    }
+    .list-box h4 { margin: 0 0 4px 0; font-size: 12px; color: #555; }
+    dialog {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 16px;
+      width: min(420px, 96vw);
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+    .dialog-buttons { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
+    code.stats { font-size: 11px; display: block; white-space: pre-wrap; color: #333; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <div class="field grow">
+      <label class="small" for="username">Username</label>
+      <input id="username" type="text" autocomplete="username" />
+    </div>
+    <div class="field grow">
+      <label class="small" for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" />
+    </div>
+    <button type="button" id="btnConnect">Connect</button>
+    <button type="button" class="secondary" id="btnDisconnect" disabled>Disconnect</button>
+  </div>
+  <div id="statusLine">Disconnected.</div>
+
+  <div class="layout">
+    <aside class="channels">
+      <h3>Channels</h3>
+      <button type="button" id="btnAdd" disabled>Add</button>
+      <div class="channel-list" id="channelList"></div>
+    </aside>
+    <main class="workspace" id="workspace">
+      <div id="workspaceEmpty">
+        Select or create a channel. Connect with username/password first if your switch requires identity.
+      </div>
+      <div id="workspaceInner" hidden>
+        <!-- Filled dynamically per channel meta -->
+      </div>
+    </main>
+  </div>
+
+  <dialog id="dlgAdd">
+    <h3 style="margin-top: 0;">Create or join channel</h3>
+    <div class="field" style="width:100%; margin-bottom:8px;">
+      <label class="small" for="chName">Name</label>
+      <input id="chName" type="text" required />
+    </div>
+    <div class="field" style="width:100%; margin-bottom:8px;">
+      <label class="small" for="chMeta">Meta</label>
+      <select id="chMeta">
+        <option value="chat">Chat (text/plain)</option>
+        <option value="audio">Opus audio</option>
+        <option value="video">H264 video</option>
+      </select>
+    </div>
+    <div class="field" style="width:100%; margin-bottom:8px;">
+      <label class="small" for="chSource">Source</label>
+      <select id="chSource">
+        <option value="text">Text only</option>
+        <option value="mic">Microphone</option>
+        <option value="camera">Camera</option>
+        <option value="screen">Screen capture</option>
+      </select>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+        <input type="radio" name="cj" value="create" checked /> Create
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+        <input type="radio" name="cj" value="join" /> Join
+      </label>
+    </div>
+    <div class="dialog-buttons">
+      <button type="button" class="secondary" id="btnAddCancel">Cancel</button>
+      <button type="button" id="btnAddOk">OK</button>
+    </div>
+  </dialog>
+
+  <script type="module" src="/app.mjs"></script>
+</body>
+</html>

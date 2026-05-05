@@ -9,6 +9,7 @@
 
 #include <protocol/rtms.hpp>
 
+#include <utils/rtms_session.hpp>
 #include <utils/transport_endpoint.hpp>
 
 namespace core
@@ -46,6 +47,7 @@ struct session_data_s
 {
     std::string                             username;
     std::optional<transport_endpoint_key_t> transport_key;
+    session_id_t                            session_id{};
 };
 
 using session_data_ptr_t = std::shared_ptr<session_data_s>;

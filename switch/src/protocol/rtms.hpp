@@ -13,12 +13,12 @@ namespace cum
 ************************************************/
 
 using bytes = cum::vector<u8, 2048>;
-using optional_bytes = std::optional<bytes>;
 using session = cum::array<u8, 16>;
 using optional_session = std::optional<session>;
 enum status_code
 {
     OK,
+    EXIST,
     NOT_FOUND,
     META_MISMATCH
 };
@@ -132,7 +132,7 @@ struct rtms
 {
     u8 protocol_version;
     u64 sender_ts_us;
-    optional_bytes session;
+    optional_session session;
     messages message;
 };
 
@@ -150,6 +150,7 @@ inline void str(const char* pName, const status_code& pIe, std::string& pCtx, bo
         pCtx = pCtx + "\"" + pName + "\":";
     }
     if (status_code::OK == pIe) pCtx += "\"OK\"";
+    if (status_code::EXIST == pIe) pCtx += "\"EXIST\"";
     if (status_code::NOT_FOUND == pIe) pCtx += "\"NOT_FOUND\"";
     if (status_code::META_MISMATCH == pIe) pCtx += "\"META_MISMATCH\"";
     pCtx = pCtx + "}";
@@ -996,6 +997,10 @@ inline void decode_per(rtms& pIe, cum::per_codec_ctx& pCtx)
         pIe.session = decltype(pIe.session)::value_type{};
         decode_per(*pIe.session, pCtx);
     }
+    else
+    {
+        pIe.session = std::nullopt;
+    }
     decode_per(pIe.message, pCtx);
 }
 
@@ -1011,13 +1016,16 @@ inline void str(const char* pName, const rtms& pIe, std::string& pCtx, bool pIsL
         pCtx = pCtx + "\"" + pName + "\":{";
     }
     size_t nOptional = 0;
-    if (pIe.session) nOptional++;
+    if (pIe.session)
+    {
+        ++nOptional;
+    }
     size_t nMandatory = 3;
     str("protocol_version", pIe.protocol_version, pCtx, !(--nMandatory+nOptional));
     str("sender_ts_us", pIe.sender_ts_us, pCtx, !(--nMandatory+nOptional));
     if (pIe.session)
     {
-        str("session", *pIe.session, pCtx, !(nMandatory+--nOptional));
+        str("session", *pIe.session, pCtx, !(nMandatory + --nOptional));
     }
     str("message", pIe.message, pCtx, !(--nMandatory+nOptional));
     pCtx = pCtx + "}";

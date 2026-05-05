@@ -82,39 +82,17 @@ cum::session clone_session_id(cum::session const& p_id)
     return o;
 }
 
-session_blob_t flatten_session(cum::session const& p_id)
-{
-    session_blob_t out{};
-    std::size_t i = 0;
-    for (auto const b : p_id)
-    {
-        if (i < out.size())
-        {
-            out[i++] = static_cast<std::uint8_t>(b);
-        }
-    }
-    return out;
-}
-
-cum::session unflatten_session(session_blob_t const& p_blob)
-{
-    cum::session o;
-    for (auto const b : p_blob)
-    {
-        o.emplace_back(b);
-    }
-    return o;
-}
-
-bool bytes_to_blob(cum::bytes const& p_bs, session_blob_t& p_out)
+bool bytes_to_session(cum::bytes const& p_bs, cum::session& p_out)
 {
     if (p_bs.size() != cum::session::max_size)
     {
         return false;
     }
-    for (std::size_t i = 0; i < cum::session::max_size; ++i)
+
+    p_out.clear();
+    for (std::size_t i = 0; i < p_bs.size(); ++i)
     {
-        p_out[i] = p_bs[i];
+        p_out.emplace_back(p_bs[i]);
     }
     return true;
 }

@@ -55,6 +55,7 @@ void LOG(level_e level, const char* format, Ts... ts)
     if (n > 0)
     {
         std::printf("%s [%s] %s\n", format_time_us(us), levelstr, buffer);
+        std::fflush(stdout);
     }
 }
 

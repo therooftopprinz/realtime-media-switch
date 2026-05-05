@@ -24,14 +24,6 @@ enum transport_type_e
     E_TRANSPORT_TYPE_UDP6_UNICAST,
 };
 
-/** Local bind for a transport peer endpoint (unicast UDP). */
-struct transport_config_s
-{
-    transport_type_e type;
-    std::string      bind_address;
-    uint16_t         bind_port{};
-};
-
 using ip_address_s = std::variant<sockaddr_in, sockaddr_in6>;
 
 struct transport4_data_s
@@ -55,7 +47,7 @@ struct ignore_transport_s
 using transport_in_t =
     std::variant<transport4_data_s, transport6_data_s, ignore_transport_s>;
 using transport_out_t =
-    std::variant<transport_config_s, transport4_data_s, transport6_data_s>;
+    std::variant<transport4_data_s, transport6_data_s>;
 
 using transport_in_queue_t  = bfc::reactive_event_queue<transport_in_t, reactor_cb_t>;
 using transport_out_queue_t = bfc::reactive_event_queue<transport_out_t, reactor_cb_t>;

@@ -1,0 +1,4 @@
+REPO=/home/ubuntu/development/realtime-media-switch  SERVER=127.0.0.1:50000  CH=ffmpeg_e2e_43436
+decoded_bytes_to_receiver=136704
+OK: media path works
+exit:0

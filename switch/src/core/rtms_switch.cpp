@@ -1,13 +1,18 @@
+#include "core/session_manager.hpp"
+#include "cum/cum.hpp"
+#include "utils/transport_endpoint.hpp"
 #include <core/rtms_switch.hpp>
 
 #include <core/identity_manager.hpp>
 
 #include <utils/logger.hpp>
 #include <utils/rtms_session.hpp>
+#include <utils/string_utils.hpp>
 
-#include <transport/transport_tx_enqueue.hpp>
+#include <utils/transport_tx_enqueue.hpp>
 
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <optional>
 #include <variant>
@@ -25,29 +30,43 @@ constexpr std::uint8_t k_protocol_version = 1;
 
 bool rtms_switch::send_encoded(transport_endpoint_key_t const& p_transport, cum::rtms const& pdu)
 {
-    auto it = m_clients.find(p_transport);
-    if (it == m_clients.end() || !it->second)
+    auto it = m_client_by_transport.find(p_transport);
+    if (it == m_client_by_transport.end() || !it->second.sender)
     {
+        LOG(utils::ERR,
+            "rtms_switch::send_encoded | no sender found for endpoint: %s",
+            utils::transport_endpoint_key_to_string(p_transport).c_str());
         return false;
     }
+
+    std::string pdu_json;
+    cum::str(nullptr, pdu, pdu_json, true);
+    LOG(utils::DBG, "rtms_switch::send_encoded | to_endpoint=%s msg=%s",
+        utils::transport_endpoint_key_to_string(p_transport).c_str(), pdu_json.c_str());
+
     alignas(std::max_align_t) std::array<std::byte, cum::bytes::max_size * 4> enc{};
+
     size_t n = 0;
     if (!utils::encode_to_wire(pdu, enc, n))
     {
         return false;
     }
-    it->second(bfc::const_buffer_view(enc.data(), n));
+
+    it->second.sender(bfc::const_buffer_view(enc.data(), n));
     return true;
 }
 
 bool rtms_switch::send_datagram(transport_endpoint_key_t const& p_transport, bfc::const_buffer_view p_view)
 {
-    auto it = m_clients.find(p_transport);
-    if (it == m_clients.end() || !it->second)
+    auto it = m_client_by_transport.find(p_transport);
+    if (it == m_client_by_transport.end() || !it->second.sender)
     {
+        LOG(utils::ERR,
+            "rtms_switch::send_datagram | no sender found for endpoint: %s",
+            utils::transport_endpoint_key_to_string(p_transport).c_str());
         return false;
     }
-    it->second(p_view);
+    it->second.sender(p_view);
     return true;
 }
 
@@ -57,149 +76,121 @@ rtms_switch::rtms_switch(rtms_switch_config_t const& p_config, utils::cv_reactor
 {
 }
 
-void rtms_switch::register_transport_rx(transport::transport_out_queue_t& p_rx, transport::transport_in_queue_t& p_tx,
-    std::uint64_t p_listener_id, bool p_transport_ipv6)
+void rtms_switch::register_transport_rx(std::shared_ptr<transport::transport_out_queue_t> p_rx,
+    std::shared_ptr<transport::transport_in_queue_t> p_tx, bool p_transport_ipv6)
 {
-    m_cv_reactor.add_read_rdy(p_rx,
-        [this, &p_rx, &p_tx, p_listener_id, p_transport_ipv6]()
+    if (!p_rx || !p_tx)
+    {
+        LOG(utils::ERR, "rtms_switch::register_transport_rx | invalid transport queues: %p, %p", p_rx.get(), p_tx.get());
+        return;
+    }
+
+    std::weak_ptr<rtms_switch> weak_self = weak_from_this();
+    m_cv_reactor.add_read_rdy(*p_rx,
+        [weak_self, p_rx, p_tx, p_transport_ipv6]()
         {
-            drain_transport_rx_queue(p_rx, p_tx, p_listener_id, p_transport_ipv6);
+            std::shared_ptr<rtms_switch> self = weak_self.lock();
+            if (!self)
+            {
+                LOG(utils::ERR, "rtms_switch::on_transport_rx_available | [rtms_switch Object] expired");
+                return;
+            }
+            self->on_transport_rx_available(p_rx, p_tx, p_transport_ipv6);
         });
 }
 
-void rtms_switch::drain_transport_rx_queue(transport::transport_out_queue_t& p_rx,
-    transport::transport_in_queue_t& p_tx, std::uint64_t p_listener_id, bool p_transport_ipv6)
+void rtms_switch::on_transport_rx_available(std::shared_ptr<transport::transport_out_queue_t> const& p_rx,
+    std::shared_ptr<transport::transport_in_queue_t> const& p_tx, bool p_transport_ipv6)
 {
-    for (auto& item : p_rx.pop())
+    for (auto& e : p_rx->pop())
     {
-        auto ensure_transport = [this, &p_tx, p_listener_id, p_transport_ipv6](sockaddr_storage const& p_peer)
-            -> std::optional<transport_endpoint_key_t>
-        {
-            transport_endpoint_key_t const key = utils::endpoint_key_with_listener(p_listener_id, p_peer);
-            auto                           it    = m_clients.find(key);
-            if (it != m_clients.end() && it->second)
-            {
-                return key;
-            }
-            transport_sender_fn send = [&p_tx, &cv = m_cv_reactor, p_transport_ipv6, peer_storage = p_peer](
-                                           bfc::const_buffer_view p_v)
-            {
-                transport::enqueue_udp_datagram(p_tx, cv, p_transport_ipv6, peer_storage, p_v);
-            };
-            on_client_joined(key, std::move(send));
-            it = m_clients.find(key);
-            if (it == m_clients.end() || !it->second)
-            {
-                return std::nullopt;
-            }
-            return key;
-        };
-
         std::visit(
-            [this, &ensure_transport](auto&& p_x)
+            [this, &p_tx, p_transport_ipv6](auto&& p_x)
             {
                 using T = std::decay_t<decltype(p_x)>;
+                std::optional<transport_endpoint_key_t> epk;
+                sockaddr_storage peer{};
                 if constexpr (std::is_same_v<T, transport::transport4_data_s>)
                 {
-                    sockaddr_storage peer{};
+                    epk = utils::sockaddr_to_endpoint_key(reinterpret_cast<sockaddr_storage const&>(p_x.address));
                     std::memset(&peer, 0, sizeof(peer));
-                    std::memcpy(&peer, &p_x.address, sizeof(p_x.address));
-                    std::optional<transport_endpoint_key_t> const tk = ensure_transport(peer);
-                    if (!tk)
-                    {
-                        return;
-                    }
-                    bfc::buffer_view const view(p_x.data.data(), p_x.data.size());
-                    on_message(*tk, view);
+                    std::memcpy(&peer, &p_x.address, sizeof(sockaddr_in));
                 }
                 else if constexpr (std::is_same_v<T, transport::transport6_data_s>)
                 {
-                    sockaddr_storage peer{};
+                    epk = utils::sockaddr_to_endpoint_key(reinterpret_cast<sockaddr_storage const&>(p_x.address));
                     std::memset(&peer, 0, sizeof(peer));
-                    std::memcpy(&peer, &p_x.address, sizeof(p_x.address));
-                    std::optional<transport_endpoint_key_t> const tk = ensure_transport(peer);
-                    if (!tk)
-                    {
-                        return;
-                    }
-                    bfc::buffer_view const view(p_x.data.data(), p_x.data.size());
-                    on_message(*tk, view);
+                    std::memcpy(&peer, &p_x.address, sizeof(sockaddr_in6));
                 }
-                else if constexpr (std::is_same_v<T, transport::transport_config_s>)
+
+                if (epk)
                 {
-                    (void)p_x;
+                    transport_endpoint_key_t const tk = *epk;
+                    auto&                          ctx = m_client_by_transport[tk];
+                    std::weak_ptr<transport::transport_in_queue_t> weak_tx = p_tx;
+                    ctx.sender = [this, weak_tx, p_transport_ipv6, peer](bfc::const_buffer_view p_view)
+                    {
+                        auto tx = weak_tx.lock();
+                        if (!tx)
+                        {
+                            LOG(utils::ERR, "rtms_switch::sender | tx queue expired");
+                            return;
+                        }
+                        transport::enqueue_udp_datagram(*tx, m_cv_reactor, p_transport_ipv6, peer, p_view);
+                    };
+
+                    on_message(*epk, p_x.data);
                 }
-            },
-            item);
+                else
+                {
+                    LOG(utils::ERR, "rtms_switch::on_transport_rx_available | invalid transport address!");
+                }
+            }, e);
     }
 }
 
 rtms_switch::~rtms_switch()
 {
     std::vector<transport_endpoint_key_t> transports;
-    transports.reserve(m_clients.size());
-    for (auto const& e : m_clients)
+    transports.reserve(m_client_by_transport.size());
+    for (auto const& e : m_client_by_transport)
     {
-        if (e.second)
-        {
-            transports.push_back(e.first);
-        }
+        transports.push_back(e.first);
     }
     for (transport_endpoint_key_t const& tk : transports)
     {
-        on_client_leaved(tk);
+        forget_transport_sessions(tk);
     }
+    m_client_by_transport.clear();
 }
 
-bool rtms_switch::identity_required() const
+bool rtms_switch::client_is_authenticated(session_data_ptr_t p_session) const
 {
-    return m_config.identity_store != nullptr && m_config.identity_store->user_count() > 0;
+    return static_cast<bool>(p_session) && !p_session->username.empty();
 }
 
-bool rtms_switch::client_is_authenticated(transport_endpoint_key_t const& p_transport_key) const
+session_data_ptr_t rtms_switch::session_for_transport(transport_endpoint_key_t const& p_transport) const
 {
-    auto const it = m_client_context.find(p_transport_key);
-    return it != m_client_context.end() && it->second.identity_authenticated;
-}
-
-std::optional<rtms_switch::session_blob_t> rtms_switch::resolve_pdu_session(transport_endpoint_key_t p_transport,
-                                                                            cum::rtms const& p_pdu) const
-{
-    auto const it_ctx = m_client_context.find(p_transport);
-    if (it_ctx == m_client_context.end() || !it_ctx->second.session_blob.has_value())
+    auto const it_ctx = m_client_by_transport.find(p_transport);
+    if (it_ctx == m_client_by_transport.end() || !it_ctx->second.session_data)
     {
-        return std::nullopt;
+        return {};
     }
 
-    session_blob_t const& bound = *it_ctx->second.session_blob;
-
-    if (p_pdu.session)
-    {
-        session_blob_t want{};
-        if (!utils::bytes_to_blob(*p_pdu.session, want))
-        {
-            return std::nullopt;
-        }
-        if (std::memcmp(want.data(), bound.data(), want.size()) != 0)
-        {
-            return std::nullopt;
-        }
-        return want;
-    }
-
-    return bound;
+    return it_ctx->second.session_data;
 }
 
-bool rtms_switch::try_send_ignore(transport_endpoint_key_t p_transport, cum::rtms const& p_incoming_pdu,
+bool rtms_switch::try_send_ignore(transport_endpoint_key_t const& p_transport, cum::rtms const& p_incoming_pdu,
                                   cum::reason_code p_reason, std::string const& p_message)
 {
     transport_endpoint_key_t const tk = p_transport;
-    int64_t const  now_us = static_cast<int64_t>(utils::utc_epoch_us_u64());
-    int64_t const  cooldown_us = static_cast<int64_t>(m_config.ignore_indication_cooldown_ms) * 1000;
+    int64_t const               now_us      = static_cast<int64_t>(utils::utc_epoch_us_u64());
+    int64_t const               cooldown_us = static_cast<int64_t>(m_config.ignore_indication_cooldown_ms) * 1000;
+    client_context_s&           ctx         = m_client_by_transport[tk];
+    std::optional<int64_t>      last_ignore_us =
+        (ctx.last_ignore_us > 0) ? std::optional<int64_t>(ctx.last_ignore_us) : std::nullopt;
 
-    auto it_last = m_last_ignore_us_by_transport.find(tk);
-    if (it_last != m_last_ignore_us_by_transport.end() && cooldown_us > 0
-        && now_us - it_last->second < cooldown_us)
+    if (last_ignore_us && cooldown_us > 0 && now_us - *last_ignore_us < cooldown_us)
     {
         return false;
     }
@@ -207,7 +198,6 @@ bool rtms_switch::try_send_ignore(transport_endpoint_key_t p_transport, cum::rtm
     cum::rtms reply{};
     reply.protocol_version = p_incoming_pdu.protocol_version;
     reply.sender_ts_us     = utils::utc_epoch_us_u64();
-    reply.session          = p_incoming_pdu.session;
     reply.message          = cum::ignored_indication{p_reason, p_message};
 
     if (!send_encoded(p_transport, reply))
@@ -217,7 +207,7 @@ bool rtms_switch::try_send_ignore(transport_endpoint_key_t p_transport, cum::rtm
 
     if (cooldown_us > 0)
     {
-        m_last_ignore_us_by_transport[tk] = now_us;
+        ctx.last_ignore_us = now_us;
     }
     return true;
 }
@@ -249,16 +239,16 @@ bool rtms_switch::payload_within_limit(std::size_t p_nbytes, std::uint16_t p_max
     return p_nbytes <= p_max_payload;
 }
 
-bool rtms_switch::stream_rate_allow(uint64_t p_channel_id, uint32_t p_pkts_per_sec_limit)
+bool rtms_switch::stream_rate_allow(channel_context_s& p_channel_context, uint32_t p_pkts_per_sec_limit)
 {
     if (p_pkts_per_sec_limit == 0)
     {
         return true;
     }
 
-    int64_t const         now_us = static_cast<int64_t>(utils::utc_epoch_us_u64());
-    rate_window_t&        w       = m_channel_rate_windows[p_channel_id];
-    int64_t constexpr     win_us = 1000000;
+    int64_t const     now_us = static_cast<int64_t>(utils::utc_epoch_us_u64());
+    rate_window_t&    w      = p_channel_context.rate_window;
+    int64_t constexpr win_us = 1000000;
     if (w.window_start_us == 0 || now_us - w.window_start_us >= win_us)
     {
         w.window_start_us = now_us;
@@ -273,63 +263,77 @@ bool rtms_switch::stream_rate_allow(uint64_t p_channel_id, uint32_t p_pkts_per_s
     return true;
 }
 
-session_data_ptr_t rtms_switch::session_data_for_blob(session_blob_t const& p_blob) const
+session_data_ptr_t rtms_switch::session_data_for_id(session_id_t const& p_session_id) const
 {
-    session_id_t const cloned = utils::clone_session_id(utils::unflatten_session(p_blob));
+    session_id_t const cloned = utils::clone_session_id(p_session_id);
     return m_session_manager.get_session(cloned);
 }
 
-void rtms_switch::prune_channel_member_if_stale(channel_context_s& p_ch, session_blob_t const& p_blob)
+void rtms_switch::rebind_session_to_transport(session_data_ptr_t p_sdp, transport_endpoint_key_t const& p_transport)
 {
-    session_data_ptr_t sdp = session_data_for_blob(p_blob);
+    if (!p_sdp)
+    {
+        return;
+    }
+    if (p_sdp->transport_key.has_value() && *p_sdp->transport_key == p_transport)
+    {
+        return;
+    }
+    if (p_sdp->transport_key.has_value())
+    {
+        auto it_old = m_client_by_transport.find(*p_sdp->transport_key);
+        if (it_old != m_client_by_transport.end() && it_old->second.session_data.get() == p_sdp.get())
+        {
+            it_old->second.session_data.reset();
+        }
+    }
+    (void)m_session_manager.create_session(p_sdp->session_id, p_transport, p_sdp->username);
+}
+
+void rtms_switch::prune_channel_member_if_stale(channel_context_s& p_ch, session_id_t const& p_session_id)
+{
+    session_data_ptr_t sdp = session_data_for_id(p_session_id);
     if (!sdp || !sdp->transport_key.has_value())
     {
-        p_ch.members.erase(p_blob);
+        p_ch.members.erase(p_session_id);
     }
 }
 
-void rtms_switch::remove_session_from_all_channels(session_blob_t const& p_blob)
+void rtms_switch::remove_session_from_all_channels(session_id_t const& p_session_id)
 {
     for (auto& e : m_channels_by_id)
     {
-        e.second.members.erase(p_blob);
+        if (e.second)
+        {
+            e.second->members.erase(p_session_id);
+        }
     }
 }
 
-void rtms_switch::bootstrap_anonymous_session(transport_endpoint_key_t p_transport)
+void rtms_switch::bootstrap_anonymous_session(transport_endpoint_key_t const& p_transport)
 {
-    auto& ctx = m_client_context[p_transport];
-    if (ctx.session_blob.has_value())
+    auto& ctx = m_client_by_transport[p_transport];
+    if (ctx.session_data)
     {
         return;
     }
 
     cum::session   sid_arr = utils::random_session_tag();
     session_id_t   sid    = utils::clone_session_id(sid_arr);
-    session_blob_t blob  = utils::flatten_session(sid);
-
-    ctx.session_blob = blob;
-    m_blob_owner_transport[blob] = p_transport;
-    m_session_manager.create_session(sid, p_transport, {});
+    ctx.session_data             = m_session_manager.create_session(sid, p_transport, {});
 }
 
-void rtms_switch::refresh_identity_state_for_transport(transport_endpoint_key_t const& p_transport_key)
+uint16_t rtms_switch::allocate_server_req_id()
 {
-    if (!identity_required())
+    uint16_t const req_id = m_next_server_req_id;
+    if (++m_next_server_req_id == 0)
     {
-        return;
+        m_next_server_req_id = 1;
     }
-    auto it = m_client_context.find(p_transport_key);
-    if (it == m_client_context.end() || !it->second.session_blob.has_value())
-    {
-        if (it != m_client_context.end())
-        {
-            it->second.identity_authenticated = false;
-        }
-    }
+    return req_id;
 }
 
-void rtms_switch::send_identity_request(transport_endpoint_key_t p_transport, cum::reason_code p_reason)
+void rtms_switch::send_identity_request(transport_endpoint_key_t const& p_transport, cum::reason_code p_reason)
 {
     uint32_t nbytes = m_config.identity_challenge_random_bytes;
     nbytes           = std::max(8u, std::min(nbytes, static_cast<uint32_t>(cum::bytes::max_size)));
@@ -340,16 +344,11 @@ void rtms_switch::send_identity_request(transport_endpoint_key_t p_transport, cu
 
     pend.new_session = utils::random_session_tag();
 
-    pend.req_id = m_next_identity_req_id;
-    if (++m_next_identity_req_id == 0)
-    {
-        m_next_identity_req_id = 1;
-    }
+    pend.req_id = allocate_server_req_id();
 
-    transport_endpoint_key_t const tk = p_transport;
-    m_identity_pending.insert_or_assign(tk, std::move(pend));
-
-    pending_identity_challenge const& stored = m_identity_pending.at(tk);
+    client_context_s& ctx = m_client_by_transport[p_transport];
+    ctx.pending_identity  = std::move(pend);
+    pending_identity_challenge const& stored = *ctx.pending_identity;
 
     cum::identity_request ir{};
     ir.req_id             = stored.req_id;
@@ -361,7 +360,6 @@ void rtms_switch::send_identity_request(transport_endpoint_key_t p_transport, cu
     cum::rtms pdu{};
     pdu.protocol_version = k_protocol_version;
     pdu.sender_ts_us      = utils::utc_epoch_us_u64();
-    pdu.session           = std::nullopt;
     pdu.message           = std::move(ir);
 
     if (!send_encoded(p_transport, pdu))
@@ -372,50 +370,21 @@ void rtms_switch::send_identity_request(transport_endpoint_key_t p_transport, cu
 
 void rtms_switch::forget_transport_sessions(transport_endpoint_key_t const& p_transport_key)
 {
-    auto const it_ctx = m_client_context.find(p_transport_key);
-    if (it_ctx == m_client_context.end() || !it_ctx->second.session_blob.has_value())
+    auto const it_ctx = m_client_by_transport.find(p_transport_key);
+    if (it_ctx == m_client_by_transport.end() || !it_ctx->second.session_data)
     {
         return;
     }
-    session_blob_t const blob = *it_ctx->second.session_blob;
-    m_blob_owner_transport.erase(blob);
-    remove_session_from_all_channels(blob);
-    m_session_manager.delete_session(utils::unflatten_session(blob));
-    m_client_context.erase(it_ctx);
+    session_id_t const& sid = it_ctx->second.session_data->session_id;
+    remove_session_from_all_channels(sid);
+    m_session_manager.delete_session(sid);
+    m_client_by_transport.erase(it_ctx);
 }
 
-void rtms_switch::on_client_joined(transport_endpoint_key_t p_transport, transport_sender_fn&& p_sender)
+void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cum::rtms& p_pdu, cum::heartbeat const&,
+                                 session_data_ptr_t p_rx_session)
 {
-    m_clients.insert_or_assign(p_transport, std::move(p_sender));
-    m_identity_pending.erase(p_transport);
-
-    if (!identity_required())
-    {
-        client_context_s& ctx = m_client_context[p_transport];
-        ctx.identity_authenticated = true;
-        bootstrap_anonymous_session(p_transport);
-        return;
-    }
-
-    m_client_context.erase(p_transport);
-}
-
-void rtms_switch::on_client_leaved(transport_endpoint_key_t p_transport)
-{
-    forget_transport_sessions(p_transport);
-    m_clients.erase(p_transport);
-    m_identity_pending.erase(p_transport);
-    m_client_context.erase(p_transport);
-}
-
-void rtms_switch::handle_heartbeat(transport_endpoint_key_t p_transport, cum::rtms const& p_pdu)
-{
-    if (!identity_required())
-    {
-        bootstrap_anonymous_session(p_transport);
-    }
-
-    if (identity_required() && !client_is_authenticated(p_transport))
+    if (!client_is_authenticated(p_rx_session))
     {
         send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
@@ -424,13 +393,13 @@ void rtms_switch::handle_heartbeat(transport_endpoint_key_t p_transport, cum::rt
     cum::rtms reply{};
     reply.protocol_version = p_pdu.protocol_version;
     reply.sender_ts_us     = utils::utc_epoch_us_u64();
-    reply.session           = p_pdu.session;
-    reply.message           = cum::heartbeat{};
+    reply.message = cum::heartbeat{};
     (void)send_encoded(p_transport, reply);
 }
 
-void rtms_switch::handle_identity_response(
-    transport_endpoint_key_t p_transport, cum::rtms const& /*p_pdu*/, cum::identity_response const& p_response)
+void rtms_switch::handle_message(
+    transport_endpoint_key_t const& p_transport, cum::rtms& /*p_pdu*/, cum::identity_response const& p_response,
+    session_data_ptr_t /*p_rx_session*/)
 {
     auto fail_retry = [&](cum::reason_code p_reason)
     {
@@ -444,12 +413,14 @@ void rtms_switch::handle_identity_response(
     }
 
     transport_endpoint_key_t const tk = p_transport;
-    auto           pit = m_identity_pending.find(tk);
-    if (pit == m_identity_pending.end() || pit->second.req_id != p_response.req_id)
+    auto it_ctx = m_client_by_transport.find(tk);
+    if (it_ctx == m_client_by_transport.end() || !it_ctx->second.pending_identity
+        || it_ctx->second.pending_identity->req_id != p_response.req_id)
     {
         fail_retry(cum::reason_code::SESSION_NOT_AVAILABLE);
         return;
     }
+    pending_identity_challenge const& pending = *it_ctx->second.pending_identity;
 
     if (!m_config.identity_store)
     {
@@ -457,13 +428,13 @@ void rtms_switch::handle_identity_response(
         return;
     }
 
-    if (!utils::session_bytes_equal(pit->second.new_session, p_response.session_to_use))
+    if (!utils::session_bytes_equal(pending.new_session, p_response.session_to_use))
     {
         fail_retry(cum::reason_code::CHALLENGE_FAILURE);
         return;
     }
 
-    cum::bytes const& challenge_blob = pit->second.challenge;
+    cum::bytes const& challenge_blob = pending.challenge;
     bool const        verified =
         m_config.identity_store->verify_identity(challenge_blob, p_response.challenge_response,
                                                  p_response.username);
@@ -473,68 +444,58 @@ void rtms_switch::handle_identity_response(
         return;
     }
 
-    session_id_t const sid_arr = utils::clone_session_id(pit->second.new_session);
-    session_blob_t const           blob       = utils::flatten_session(sid_arr);
-    session_data_ptr_t existing = session_data_for_blob(blob);
+    session_id_t const sid_arr   = utils::clone_session_id(pending.new_session);
+    session_data_ptr_t existing  = session_data_for_id(sid_arr);
 
-    if (existing && !existing->username.empty() && existing->username != p_response.username)
+    if (existing && (existing->username.empty() || existing->username != p_response.username))
     {
-        fail_retry(cum::reason_code::CHALLENGE_FAILURE);
+        fail_retry(cum::reason_code::SESSION_NOT_AVAILABLE);
         return;
     }
 
-    auto mig = m_blob_owner_transport.find(blob);
-    if (mig != m_blob_owner_transport.end() && mig->second != tk)
+    if (existing && existing->transport_key.has_value() && *existing->transport_key != tk)
     {
-        transport_endpoint_key_t const old_tk = mig->second;
+        transport_endpoint_key_t const old_tk = *existing->transport_key;
 
-        auto it_old = m_client_context.find(old_tk);
-        if (it_old != m_client_context.end())
+        auto it_old = m_client_by_transport.find(old_tk);
+        if (it_old != m_client_by_transport.end())
         {
-            auto& old_blob = it_old->second.session_blob;
-            if (old_blob.has_value()
-                && std::memcmp(old_blob->data(), blob.data(), blob.size()) == 0)
+            session_data_ptr_t const old_data = it_old->second.session_data;
+            if (old_data && session_id_equal_t{}(old_data->session_id, sid_arr))
             {
-                old_blob.reset();
+                it_old->second.session_data.reset();
             }
-            if (!it_old->second.session_blob.has_value())
+            if (!it_old->second.session_data)
             {
-                m_client_context.erase(it_old);
+                m_client_by_transport.erase(it_old);
             }
         }
-        m_blob_owner_transport.erase(blob);
-        refresh_identity_state_for_transport(old_tk);
     }
 
-    m_identity_pending.erase(pit);
-
-    client_context_s& ctx = m_client_context[tk];
-    ctx.identity_authenticated = true;
-    ctx.session_blob           = blob;
-
-    m_session_manager.create_session(sid_arr, p_transport, p_response.username);
-    m_blob_owner_transport[blob] = tk;
+    client_context_s& ctx = m_client_by_transport[tk];
+    ctx.pending_identity.reset();
+    ctx.session_data = m_session_manager.create_session(sid_arr, p_transport, p_response.username);
 
     LOG(utils::INF, "rtms_switch: identity ok user=%s", p_response.username.c_str());
 }
 
-void rtms_switch::handle_identity_request(
-    transport_endpoint_key_t p_transport, cum::rtms const& p_pdu, cum::identity_request const& /*p_request*/)
+void rtms_switch::handle_message(
+    transport_endpoint_key_t const& p_transport, cum::rtms& p_pdu, cum::create_request const& p_create_request,
+    session_data_ptr_t p_rx_session)
 {
-    (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::UNRECOGNIZED_TRANSPORT, {});
-}
-
-void rtms_switch::handle_create_request(transport_endpoint_key_t p_transport, cum::rtms const& p_pdu,
-                                        cum::create_request const& p_create_request)
-{
-    std::optional<session_blob_t> const blob_opt = resolve_pdu_session(p_transport, p_pdu);
-    if (!blob_opt)
+    if (!client_is_authenticated(p_rx_session))
+    {
+        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        return;
+    }
+    session_data_ptr_t const sess = p_rx_session;
+    if (!sess)
     {
         (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
         return;
     }
 
-    session_blob_t const blob = *blob_opt;
+    session_id_t const& sid = sess->session_id;
 
     cum::channel_limits merged = merge_with_shared_limits(p_create_request.limits);
 
@@ -544,29 +505,28 @@ void rtms_switch::handle_create_request(transport_endpoint_key_t p_transport, cu
         cum::rtms out{};
         out.protocol_version            = k_protocol_version;
         out.sender_ts_us                = utils::utc_epoch_us_u64();
-        out.session                     = p_pdu.session;
         cum::create_response rsp{};
         rsp.req_id                       = p_create_request.req_id;
         rsp.channel_id                   = 0;
-        rsp.code                         = cum::status_code::NOT_FOUND;
+        rsp.code                         = cum::status_code::EXIST;
         out.message                      = rsp;
         (void)send_encoded(p_transport, out);
         return;
     }
 
-    uint64_t const cid           = m_next_channel_id++;
-    channel_context_s ch{};
-    ch.name                      = p_create_request.channel_name;
-    ch.metadata                  = p_create_request.metadata;
-    ch.limits                     = merged;
-    ch.members.insert(blob);
-    m_channels_by_id.emplace(cid, std::move(ch));
-    m_channel_id_by_name.emplace(p_create_request.channel_name, cid);
+    uint64_t const cid = m_next_channel_id++;
+    auto const    ch  = std::make_shared<channel_context_s>();
+    ch->id            = cid;
+    ch->name          = p_create_request.channel_name;
+    ch->metadata      = p_create_request.metadata;
+    ch->limits        = merged;
+    ch->members.emplace(utils::clone_session_id(sid));
+    m_channels_by_id.emplace(cid, ch);
+    m_channel_id_by_name.emplace(p_create_request.channel_name, ch);
 
     cum::rtms out{};
     out.protocol_version = k_protocol_version;
     out.sender_ts_us      = utils::utc_epoch_us_u64();
-    out.session           = p_pdu.session;
 
     cum::create_response rsp{};
     rsp.req_id     = p_create_request.req_id;
@@ -576,17 +536,23 @@ void rtms_switch::handle_create_request(transport_endpoint_key_t p_transport, cu
     (void)send_encoded(p_transport, out);
 }
 
-void rtms_switch::handle_join_request(transport_endpoint_key_t p_transport, cum::rtms const& p_pdu,
-                                      cum::join_request const& p_join_request)
+void rtms_switch::handle_message(
+    transport_endpoint_key_t const& p_transport, cum::rtms& p_pdu, cum::join_request const& p_join_request,
+    session_data_ptr_t p_rx_session)
 {
-    std::optional<session_blob_t> const blob_opt = resolve_pdu_session(p_transport, p_pdu);
-    if (!blob_opt)
+    if (!client_is_authenticated(p_rx_session))
+    {
+        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        return;
+    }
+    session_data_ptr_t const sess = p_rx_session;
+    if (!sess)
     {
         (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
         return;
     }
 
-    session_blob_t const blob = *blob_opt;
+    session_id_t const& sid = sess->session_id;
 
     auto const name_it = m_channel_id_by_name.find(p_join_request.channel_name);
     if (name_it == m_channel_id_by_name.end())
@@ -594,7 +560,6 @@ void rtms_switch::handle_join_request(transport_endpoint_key_t p_transport, cum:
         cum::rtms out{};
         out.protocol_version = k_protocol_version;
         out.sender_ts_us      = utils::utc_epoch_us_u64();
-        out.session           = p_pdu.session;
 
         cum::join_response jr{};
         jr.req_id     = p_join_request.req_id;
@@ -606,14 +571,12 @@ void rtms_switch::handle_join_request(transport_endpoint_key_t p_transport, cum:
         return;
     }
 
-    uint64_t const cid = name_it->second;
-    auto ch_it         = m_channels_by_id.find(cid);
-    if (ch_it == m_channels_by_id.end())
+    channel_context_s* ch_ptr = name_it->second.get();
+    if (!ch_ptr)
     {
         cum::rtms out{};
         out.protocol_version = k_protocol_version;
         out.sender_ts_us      = utils::utc_epoch_us_u64();
-        out.session           = p_pdu.session;
 
         cum::join_response jr{};
         jr.req_id     = p_join_request.req_id;
@@ -625,18 +588,17 @@ void rtms_switch::handle_join_request(transport_endpoint_key_t p_transport, cum:
         return;
     }
 
-    channel_context_s& ch = ch_it->second;
-    prune_channel_member_if_stale(ch, blob);
+    channel_context_s& ch = *ch_ptr;
+    prune_channel_member_if_stale(ch, sid);
 
     if (ch.metadata != p_join_request.metadata)
     {
         cum::rtms out{};
         out.protocol_version            = k_protocol_version;
         out.sender_ts_us                = utils::utc_epoch_us_u64();
-        out.session                     = p_pdu.session;
         cum::join_response jr{};
         jr.req_id     = p_join_request.req_id;
-        jr.channel_id = cid;
+        jr.channel_id = ch.id;
         jr.code       = cum::status_code::META_MISMATCH;
         jr.limits     = std::nullopt;
         out.message   = jr;
@@ -644,33 +606,38 @@ void rtms_switch::handle_join_request(transport_endpoint_key_t p_transport, cum:
         return;
     }
 
-    ch.members.insert(blob);
+    ch.members.emplace(utils::clone_session_id(sid));
 
     cum::rtms out{};
     out.protocol_version             = k_protocol_version;
     out.sender_ts_us                 = utils::utc_epoch_us_u64();
-    out.session                      = p_pdu.session;
 
     cum::join_response jr{};
     jr.req_id     = p_join_request.req_id;
-    jr.channel_id = cid;
+    jr.channel_id = ch.id;
     jr.code       = cum::status_code::OK;
     jr.limits     = ch.limits;
     out.message   = jr;
     (void)send_encoded(p_transport, out);
 }
 
-void rtms_switch::handle_leave_request(transport_endpoint_key_t p_transport, cum::rtms const& p_pdu,
-                                       cum::leave_request const& p_leave_request)
+void rtms_switch::handle_message(
+    transport_endpoint_key_t const& p_transport, cum::rtms& p_pdu, cum::leave_request const& p_leave_request,
+    session_data_ptr_t p_rx_session)
 {
-    std::optional<session_blob_t> const blob_opt = resolve_pdu_session(p_transport, p_pdu);
-    if (!blob_opt)
+    if (!client_is_authenticated(p_rx_session))
+    {
+        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        return;
+    }
+    session_data_ptr_t const sess = p_rx_session;
+    if (!sess)
     {
         (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
         return;
     }
 
-    session_blob_t const blob = *blob_opt;
+    session_id_t const& sid = sess->session_id;
 
     auto ch_it = m_channels_by_id.find(p_leave_request.channel_id);
     if (ch_it == m_channels_by_id.end())
@@ -679,8 +646,15 @@ void rtms_switch::handle_leave_request(transport_endpoint_key_t p_transport, cum
         return;
     }
 
-    auto& ch = ch_it->second;
-    if (ch.members.erase(blob) == 0)
+    auto* const ch_ptr = ch_it->second.get();
+    if (!ch_ptr)
+    {
+        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_JOINED, {});
+        return;
+    }
+
+    auto& ch = *ch_ptr;
+    if (ch.members.erase(sid) == 0)
     {
         (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_JOINED, {});
         return;
@@ -688,29 +662,37 @@ void rtms_switch::handle_leave_request(transport_endpoint_key_t p_transport, cum
 
     cum::rtms out{};
     out.protocol_version = k_protocol_version;
-    out.sender_ts_us      = utils::utc_epoch_us_u64();
-    out.session           = p_pdu.session;
+    out.sender_ts_us     = utils::utc_epoch_us_u64();
 
     cum::leave_response lr{};
-    lr.req_id           = p_leave_request.req_id;
+    lr.req_id            = p_leave_request.req_id;
     out.message          = lr;
     (void)send_encoded(p_transport, out);
 }
 
-void rtms_switch::handle_stream_data(transport_endpoint_key_t p_transport, cum::rtms pdu)
+void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cum::rtms& pdu,
+                                 cum::stream_data const&, session_data_ptr_t p_rx_session)
 {
-    std::optional<session_blob_t> const blob_opt = resolve_pdu_session(p_transport, pdu);
-    if (!blob_opt)
+    auto const ep = utils::transport_endpoint_key_to_string(p_transport);
+    if (!client_is_authenticated(p_rx_session))
     {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop not authenticated from=%s", ep.c_str());
+        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        return;
+    }
+    session_data_ptr_t const sender = p_rx_session;
+    if (!sender)
+    {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop session mismatch from=%s", ep.c_str());
         (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
         return;
     }
 
-    auto& sd                      = std::get<cum::stream_data>(pdu.message);
+    auto& sd = std::get<cum::stream_data>(pdu.message);
 
-    session_data_ptr_t const sess = session_data_for_blob(*blob_opt);
-    if (!sess || !sess->transport_key.has_value())
+    if (!sender->transport_key.has_value())
     {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop sender transport missing from=%s", ep.c_str());
         (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
         return;
     }
@@ -718,29 +700,47 @@ void rtms_switch::handle_stream_data(transport_endpoint_key_t p_transport, cum::
     auto ch_it = m_channels_by_id.find(sd.channel_id);
     if (ch_it == m_channels_by_id.end())
     {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop unknown channel_id=%" PRIu64 " from=%s",
+            static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
         (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_JOINED, {});
         return;
     }
 
-    channel_context_s& ch = ch_it->second;
-    prune_channel_member_if_stale(ch, *blob_opt);
-    if (ch.members.find(*blob_opt) == ch.members.end())
+    auto* const ch_ptr = ch_it->second.get();
+    if (!ch_ptr)
     {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop null channel context channel_id=%" PRIu64 " from=%s",
+            static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
+        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_JOINED, {});
+        return;
+    }
+
+    channel_context_s& ch = *ch_ptr;
+    session_id_t const& sender_sid = sender->session_id;
+    prune_channel_member_if_stale(ch, sender_sid);
+    if (ch.members.find(sender_sid) == ch.members.end())
+    {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop sender not joined channel_id=%" PRIu64 " from=%s",
+            static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
         (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_JOINED, {});
         return;
     }
 
     if (!payload_within_limit(sd.payload.size(), ch.limits.max_payload_size))
     {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop payload too large size=%zu limit=%u channel_id=%" PRIu64 " from=%s",
+            sd.payload.size(), ch.limits.max_payload_size, static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
         return;
     }
 
-    if (!stream_rate_allow(sd.channel_id, ch.limits.pkt_rate_limit))
+    if (!stream_rate_allow(ch, ch.limits.pkt_rate_limit))
     {
+        LOG(utils::DBG, "rtms_switch::stream_data | drop rate limited limit=%u channel_id=%" PRIu64 " from=%s",
+            ch.limits.pkt_rate_limit, static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
         return;
     }
 
-    sd.from_username = sess->username;
+    sd.from_username = sender->username;
 
     alignas(std::max_align_t) std::array<std::byte, cum::bytes::max_size * 4> wire{};
     size_t                                                    nbytes = 0;
@@ -749,28 +749,38 @@ void rtms_switch::handle_stream_data(transport_endpoint_key_t p_transport, cum::
         return;
     }
 
+    std::string pdu_json;
+    cum::str(nullptr, pdu, pdu_json, true);
+    LOG(utils::DBG, "rtms_switch::stream_data | sending from %s(%s) to channel=%s msg=%s",
+        utils::transport_endpoint_key_to_string(p_transport).c_str(),
+        sender->username.c_str(),
+        ch.name.c_str(),
+        pdu_json.c_str());
+
     auto const view = bfc::const_buffer_view(wire.data(), nbytes);
 
-    std::vector<session_blob_t> member_copy(ch.members.begin(), ch.members.end());
-    for (session_blob_t const& member_blob : member_copy)
+    for (auto it = ch.members.begin(); it != ch.members.end();)
     {
-        if (member_blob == *blob_opt)
+        session_id_t const& member_sid = *it;
+        if (session_id_equal_t{}(member_sid, sender_sid))
         {
+            ++it;
             continue;
         }
-        prune_channel_member_if_stale(ch, member_blob);
-        session_data_ptr_t const peer = session_data_for_blob(member_blob);
+        session_data_ptr_t const peer = session_data_for_id(member_sid);
         if (!peer || !peer->transport_key.has_value())
         {
+            it = ch.members.erase(it);
             continue;
         }
         (void)send_datagram(*peer->transport_key, view);
+        ++it;
     }
 }
 
-void rtms_switch::on_message(transport_endpoint_key_t p_transport, bfc::buffer_view p_payload)
+void rtms_switch::on_message(transport_endpoint_key_t const& p_transport, bfc::buffer_view p_payload)
 {
-    cum::rtms            pdu{};
+    cum::rtms pdu{};
     cum::per_codec_ctx ctx(p_payload.data(), p_payload.size());
     try
     {
@@ -778,59 +788,41 @@ void rtms_switch::on_message(transport_endpoint_key_t p_transport, bfc::buffer_v
     }
     catch (std::exception const&)
     {
-        LOG(utils::DBG, "rtms_switch: dropped datagram (PER decode failed)");
+        LOG(utils::WRN, "rtms_switch: dropped datagram (PER decode failed)");
         return;
     }
 
-    if (std::holds_alternative<cum::heartbeat>(pdu.message))
-    {
-        handle_heartbeat(p_transport, pdu);
-        return;
-    }
+    std::string pdu_json;
+    cum::str(nullptr, pdu, pdu_json, true);
+    LOG(utils::INF, "rtms_switch::on_message | from_endpoint=%s msg=%s",
+        utils::transport_endpoint_key_to_string(p_transport).c_str(), pdu_json.c_str());
 
+    session_data_ptr_t rx_sess{};
     if (std::holds_alternative<cum::identity_response>(pdu.message))
     {
-        handle_identity_response(p_transport, pdu, std::get<cum::identity_response>(pdu.message));
-        return;
+        rx_sess = session_for_transport(p_transport);
     }
-
-    if (identity_required() && !client_is_authenticated(p_transport))
+    else if (pdu.session.has_value())
     {
-        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
-        return;
+        rx_sess = session_data_for_id(*pdu.session);
+        if (!rx_sess)
+        {
+            (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+            return;
+        }
+        rebind_session_to_transport(rx_sess, p_transport);
     }
-
-    if (std::holds_alternative<cum::identity_request>(pdu.message))
+    else
     {
-        handle_identity_request(p_transport, pdu, std::get<cum::identity_request>(pdu.message));
-        return;
+        rx_sess = session_for_transport(p_transport);
     }
 
-    if (std::holds_alternative<cum::create_request>(pdu.message))
-    {
-        handle_create_request(p_transport, pdu, std::get<cum::create_request>(pdu.message));
-        return;
-    }
-
-    if (std::holds_alternative<cum::join_request>(pdu.message))
-    {
-        handle_join_request(p_transport, pdu, std::get<cum::join_request>(pdu.message));
-        return;
-    }
-
-    if (std::holds_alternative<cum::leave_request>(pdu.message))
-    {
-        handle_leave_request(p_transport, pdu, std::get<cum::leave_request>(pdu.message));
-        return;
-    }
-
-    if (std::holds_alternative<cum::stream_data>(pdu.message))
-    {
-        handle_stream_data(p_transport, std::move(pdu));
-        return;
-    }
-
-    /* Server-originated PDUs received from a client are ignored. */
+    std::visit(
+        [this, &p_transport, &pdu, rx_sess](auto const& p_x)
+        {
+            handle_message(p_transport, pdu, p_x, rx_sess);
+        },
+        pdu.message);
 }
 
 } // namespace core

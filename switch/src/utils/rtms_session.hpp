@@ -3,14 +3,11 @@
 
 #include <protocol/rtms.hpp>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace utils
 {
-
-using session_blob_t = std::array<std::uint8_t, cum::session::max_size>;
 
 [[nodiscard]] uint64_t utc_epoch_us_u64();
 
@@ -26,11 +23,7 @@ void fill_random_octets(std::uint8_t* p_out, std::size_t nbytes);
 /** cum::array copy ctor uses a broken emplace API; rebuild id via emplace into containers instead. */
 [[nodiscard]] cum::session clone_session_id(cum::session const& p_id);
 
-[[nodiscard]] session_blob_t flatten_session(cum::session const& p_id);
-
-[[nodiscard]] cum::session unflatten_session(session_blob_t const& p_blob);
-
-[[nodiscard]] bool bytes_to_blob(cum::bytes const& p_bs, session_blob_t& p_out);
+[[nodiscard]] bool bytes_to_session(cum::bytes const& p_bs, cum::session& p_out);
 
 } // namespace utils
 

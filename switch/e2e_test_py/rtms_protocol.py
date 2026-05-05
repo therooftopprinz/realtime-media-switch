@@ -5,18 +5,13 @@ from enum import IntEnum
 
 from typing import Optional, TypedDict, Union
 
-from cum.cum import CodecError, PerCodecCtx, check_optional, set_optional
+from cum.cum import CodecError, PerCodecCtx, check_optional, set_optional, read_integral_le, write_integral_le
 
-
-# RTMS: unsigned fixed-width fields (LE, match target_cpp memcpy on LE hosts)
-from cum.cum import read_integral_le, write_integral_le
-# CUM u8/u16/u32/u64 → Python int (TypedDict / list[] annotations only)
+# CUM u8/u16/u32/u64 → Python int (TypedDict annotations)
 u8 = u16 = u32 = u64 = int
+
 bytes = list[u8]  # CUM using bytes
 # CUM dynamic sequence: at most 2048 elements.
-
-optional_bytes = Optional[bytes]  # CUM using optional_bytes
-# CUM optional; use None when absent.
 
 session = list[u8]  # fixed len '16'  # CUM using session
 # CUM static array: fixed length '16' (not emitted separately in Python).
@@ -26,8 +21,9 @@ optional_session = Optional[session]  # CUM using optional_session
 
 class status_code(IntEnum):
     OK = 0
-    NOT_FOUND = 1
-    META_MISMATCH = 2
+    EXIST = 1
+    NOT_FOUND = 2
+    META_MISMATCH = 3
 
 class reason_code(IntEnum):
     UNRECOGNIZED_TRANSPORT = 0
@@ -160,12 +156,12 @@ messages = Union[
 class rtms(TypedDict):
     protocol_version: u8
     sender_ts_us: u64
-    session: Optional[bytes]
+    session: Optional[session]
     message: messages
 
 # --- Packed encoding (PER-byte aligned, enums as i32 LE) ---
 
-
+# Unsigned fixed-width scalars (LE; match target_cpp on LE hosts)
 def encode_using_u8(v, ctx: PerCodecCtx) -> None:
     ctx.write_u8(int(v))
 
@@ -269,7 +265,8 @@ def encode_using_heartbeat(pie, ctx: PerCodecCtx) -> None:
     pass
 
 def decode_using_heartbeat(ctx: PerCodecCtx):
-    return {}
+    pie = {}
+    return pie
 
 # Codec: sequence identity_request
 def encode_using_identity_request(pie, ctx: PerCodecCtx) -> None:
@@ -525,7 +522,7 @@ def encode_using_rtms(pie, ctx: PerCodecCtx) -> None:
     encode_using_u8(pie["protocol_version"], ctx)
     encode_using_u64(pie["sender_ts_us"], ctx)
     if pie["session"] is not None:
-        encode_using_bytes(pie["session"], ctx)
+        encode_using_session(pie["session"], ctx)
     encode_using_messages(pie["message"], ctx)
 
 def decode_using_rtms(ctx: PerCodecCtx):
@@ -534,7 +531,7 @@ def decode_using_rtms(ctx: PerCodecCtx):
     pie["protocol_version"] = decode_using_u8(ctx)
     pie["sender_ts_us"] = decode_using_u64(ctx)
     if check_optional(optional_mask, 0):
-        pie["session"] = decode_using_bytes(ctx)
+        pie["session"] = decode_using_session(ctx)
     else:
         pie["session"] = None
     pie["message"] = decode_using_messages(ctx)

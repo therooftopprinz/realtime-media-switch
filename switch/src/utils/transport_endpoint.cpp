@@ -27,40 +27,38 @@ std::size_t transport_endpoint_hash::operator()(transport_endpoint_key_t const& 
 {
     std::size_t const h0 = std::hash<std::uint64_t>{}(std::get<0>(k));
     std::size_t const h1 = std::hash<std::uint64_t>{}(std::get<1>(k));
-    std::size_t const h2 = std::hash<std::uint64_t>{}(std::get<2>(k));
-    std::size_t const h3 = std::hash<std::uint16_t>{}(std::get<3>(k));
+    std::size_t const h2 = std::hash<std::uint16_t>{}(std::get<2>(k));
     return h0 ^ (h1 + 0x9e3779b97f4a7c15ULL + (h0 << 6) + (h0 >> 2))
-         ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2))
-         ^ (h3 + 0x9e3779b97f4a7c15ULL + (h2 << 6) + (h2 >> 2));
+         ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
 }
 
-transport_endpoint_key_t endpoint_key_with_listener(std::uint64_t p_listener, sockaddr_storage const& p_addr)
+std::optional<transport_endpoint_key_t> sockaddr_to_endpoint_key(sockaddr_storage const& p_addr)
 {
-    std::uint8_t  raw[16]{};
+    std::uint64_t addr_lo = 0;
+    std::uint64_t addr_hi = 0;
     std::uint16_t port = 0;
 
     if (p_addr.ss_family == AF_INET)
     {
         auto const& a = reinterpret_cast<sockaddr_in const&>(p_addr);
         port            = ntohs(a.sin_port);
-        raw[10]         = 0xff;
-        raw[11]         = 0xff;
-        std::memcpy(&raw[12], &a.sin_addr.s_addr, 4);
+        addr_lo         = ntohl(a.sin_addr.s_addr);
     }
     else if (p_addr.ss_family == AF_INET6)
     {
         auto const& a = reinterpret_cast<sockaddr_in6 const&>(p_addr);
+        std::uint8_t raw[16]{};
         port            = ntohs(a.sin6_port);
         std::memcpy(raw, &a.sin6_addr, 16);
+        addr_hi = load_be64(raw);
+        addr_lo = load_be64(raw + 8);
     }
     else
     {
-        return {p_listener, 0, 0, 0};
+        return std::nullopt;
     }
 
-    std::uint64_t const hi = load_be64(raw);
-    std::uint64_t const lo = load_be64(raw + 8);
-    return {p_listener, hi, lo, port};
+    return transport_endpoint_key_t{addr_lo, addr_hi, port};
 }
 
 } // namespace utils

@@ -238,8 +238,10 @@ void load_identity_sources_from_config(bfc::configuration_parser const& cfg,
 /** One UDP listen socket plus the TX/RX ring pair registered on `rtms_switch`. */
 struct udp_listen_bundle
 {
-    transport::transport_in_queue_t            tx_queue{};
-    transport::transport_out_queue_t           rx_queue{};
+    std::shared_ptr<transport::transport_in_queue_t>  tx_queue{
+        std::make_shared<transport::transport_in_queue_t>()};
+    std::shared_ptr<transport::transport_out_queue_t> rx_queue{
+        std::make_shared<transport::transport_out_queue_t>()};
     std::shared_ptr<transport::udp_transport> udp;
 };
 
@@ -251,9 +253,9 @@ std::shared_ptr<udp_listen_bundle> attach_udp_listener(core::rtms_switch& p_swit
 {
     transport::udp_transport_config_t udp_cfg = make_udp_listen_config(std::move(p_bind_host), p_bind_port);
     auto                               b       = std::make_shared<udp_listen_bundle>();
-    b->udp = std::make_shared<transport::udp_transport>(udp_cfg, p_socket_reactor, p_cv_reactor, b->tx_queue,
-        b->rx_queue);
-    p_switch.register_transport_rx(b->rx_queue, b->tx_queue, p_listener_slot,
+    b->udp = std::make_shared<transport::udp_transport>(
+        udp_cfg, p_socket_reactor, p_cv_reactor, *b->tx_queue, *b->rx_queue);
+    p_switch.register_transport_rx(b->rx_queue, b->tx_queue,
         transport::udp_bind_host_is_ipv6(udp_cfg.host));
     b->udp->start();
     LOG(utils::INF, "%s %s:%u (switch idle %llu ms)", p_log_summary, udp_cfg.host.c_str(),
@@ -298,7 +300,7 @@ int main(int argc, char* argv[])
     load_identity_sources_from_config(configuration, identity_file_base);
 
     core::rtms_switch_config_t sw_cfg = make_rtms_switch_config(configuration);
-    core::rtms_switch            sw(sw_cfg, cv_reactor);
+    auto                        sw    = std::make_shared<core::rtms_switch>(sw_cfg, cv_reactor);
 
     /** Keeps UDP transport objects alive for process lifetime (local-relay vs public are separate instances). */
     std::vector<std::shared_ptr<udp_listen_bundle>> udp_keepalive;
@@ -324,7 +326,7 @@ int main(int argc, char* argv[])
         if (loc_en)
         {
             std::uint16_t const lp = cfg_u16(configuration, "transport.local.port").value_or(25000);
-            push_listener(attach_udp_listener(sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
+            push_listener(attach_udp_listener(*sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
                 cfg_str(configuration, "transport.local.interface").value_or("127.0.0.1"), lp,
                 "UDP[local-relay]"));
         }
@@ -333,7 +335,7 @@ int main(int argc, char* argv[])
         if (pub_en)
         {
             push_listener(
-                attach_udp_listener(sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
+                attach_udp_listener(*sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
                     cfg_str(configuration, "transport.public.interface").value_or("0.0.0.0"),
                     cfg_u16(configuration, "transport.public.port").value_or(25001), "UDP[public-internet]"));
         }
@@ -341,7 +343,7 @@ int main(int argc, char* argv[])
         // Single-port fallback only when neither role is enabled (backward compatibility).
         if (udp_keepalive.empty())
         {
-            push_listener(attach_udp_listener(sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
+            push_listener(attach_udp_listener(*sw, reactor, cv_reactor, sw_cfg, next_listener_slot++,
                 cfg_str(configuration, "transport.host").value_or("0.0.0.0"),
                 cfg_u16(configuration, "transport.port").value_or(12345), "UDP[legacy]"));
         }

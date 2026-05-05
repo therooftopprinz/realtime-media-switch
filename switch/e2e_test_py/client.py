@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-RTMS UDP test client — stdin for outbound payload lines once joined/creating;
-decoded server PDUs printed to stdout.
+RTMS UDP test client — stdin/stdout carry stream_data payloads only once on a channel;
+all other diagnostics and PDU traffic go to username_YYYY_MM_DD_HH_mm_SS.log.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import hmac
 import pathlib
@@ -71,6 +72,50 @@ def message_tag(message: dict) -> str:
     return next(iter(message.keys()))
 
 
+def log_filename_for_user(username: str) -> str:
+    safe = (username or "").replace("/", "_").replace("\\", "_") or "anonymous"
+    return "{}.log".format(safe)
+
+
+def summarize_message_for_log(message: dict[str, Any]) -> str:
+    """One-line description; stream_data payload replaced with byte count."""
+    tag = message_tag(message)
+    body = message[tag]
+    if tag == "stream_data" and isinstance(body, dict):
+        pl = body.get("payload")
+        n = len(pl) if isinstance(pl, list) else 0
+        body = dict(body)
+        body["payload"] = "<{} bytes>".format(n)
+    return "{{{!r}: {!r}}}".format(tag, body)
+
+
+class SessionLog:
+    def __init__(self, path: pathlib.Path) -> None:
+        self._path = path
+        self._f = path.open("w", encoding="utf-8")
+        self._lock = threading.Lock()
+
+    def path(self) -> pathlib.Path:
+        return self._path
+
+    def close(self) -> None:
+        with self._lock:
+            self._f.close()
+
+    def line(self, s: str) -> None:
+        now = dt.datetime.now()
+        ts = "{}{:03d}".format(now.strftime("%Y-%m-%d_%H:%M:%S."), now.microsecond // 1000)
+        with self._lock:
+            self._f.write("{} {}\n".format(ts, s.rstrip("\n")))
+            self._f.flush()
+
+    def sent(self, message: dict[str, Any]) -> None:
+        self.line("sent: {}".format(summarize_message_for_log(message)))
+
+    def received(self, message: dict[str, Any]) -> None:
+        self.line("received: {}".format(summarize_message_for_log(message)))
+
+
 def hmac_challenge_response(password: str, challenge: list[int]) -> list[int]:
     key = password.encode()
     msg = bytes(challenge)
@@ -86,12 +131,14 @@ class ClientState:
         username: str,
         password: str,
         metadata: str,
+        session_log: SessionLog,
     ):
         self.sock = sock
         self.server_addr = server_addr
         self.username = username
         self.password = password
         self.metadata = metadata
+        self.session_log = session_log
         self.next_req_id = 1
         self.session_blob: Optional[list[int]] = None
         self.channel_id: Optional[int] = None
@@ -105,18 +152,21 @@ class ClientState:
                 self.next_req_id = 1
             return rid
 
-    def send_pdu(self, message: dict, session: Optional[list[int]] = None) -> None:
-        pdu = {
+    def send_pdu(self, message: dict) -> None:
+        self.session_log.sent(message)
+        # Outer PDU `session` (16 bytes): absent until negotiated via identity_request /
+        # identity_response; server routes by transport until then, then by session id if set.
+        pdu: dict[str, Any] = {
             "protocol_version": PROTOCOL_VERSION,
             "sender_ts_us": utc_epoch_us_u64(),
-            "session": session,
             "message": message,
+            "session": list(self.session_blob) if self.session_blob is not None else None,
         }
         blob = pdu_encode(pdu)
         self.sock.sendto(blob, self.server_addr)
 
     def send_heartbeat(self) -> None:
-        self.send_pdu({"heartbeat": {}}, session=self.session_blob)
+        self.send_pdu({"heartbeat": {}})
 
     def handle_identity_request(self, ir: dict) -> None:
         challenge = ir["challenge_request"]
@@ -129,16 +179,17 @@ class ClientState:
             "challenge_response": hmac_challenge_response(self.password, challenge),
             "session_to_use": use,
         }
-        # Server does not echo session on the PDU envelope after identity_ok; reuse the
-        # negotiated blob for explicit session tagging (needed when transport has multiple).
         self.session_blob = use
-        self.send_pdu({"identity_response": rsp}, session=None)
+        self.send_pdu({"identity_response": rsp})
 
     def authenticated(self, username: Optional[str]) -> None:
         if not username or self.password == "":
-            sys.stderr.write(
-                "client: --create/--join require --username and --password when identity is enforced\n"
+            msg = (
+                "client: --create/--join require --username and --password "
+                "when identity is enforced"
             )
+            self.session_log.line(msg)
+            sys.stderr.write(msg + "\n")
             sys.exit(2)
 
     def run_create(self, channel_name: str) -> Optional[int]:
@@ -150,7 +201,7 @@ class ClientState:
             "metadata": self.metadata,
             "limits": {"pkt_rate_limit": 0, "max_payload_size": 0},
         }
-        self.send_pdu({"create_request": cr}, session=self.session_blob)
+        self.send_pdu({"create_request": cr})
         return self.await_response(("create_response", rid))
 
     def run_join(self, channel_name: str) -> Optional[int]:
@@ -161,74 +212,63 @@ class ClientState:
             "channel_name": channel_name,
             "metadata": self.metadata,
         }
-        self.send_pdu({"join_request": jr}, session=self.session_blob)
+        self.send_pdu({"join_request": jr})
         return self.await_response(("join_response", rid))
 
     def await_response(self, expect: tuple[str, int]) -> Optional[int]:
         kind, rid = expect
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
-            pdu = recv_pdu(self.sock, min(2.0, deadline - time.monotonic()))
+            pdu = recv_pdu(
+                self.sock,
+                min(2.0, deadline - time.monotonic()),
+                self.session_log,
+            )
             if pdu is None:
                 continue
-            self.process_incoming_pdu(pdu, skip_print=True)
+            self.process_incoming_pdu(pdu)
             msg = pdu["message"]
             tag = message_tag(msg)
             if tag == kind and msg[tag]["req_id"] == rid:
                 if tag == "create_response":
                     if msg[tag]["code"] != rp.status_code.OK:
-                        sys.stdout.write(
-                            "create_response code={}\n".format(msg[tag]["code"].name)
+                        self.session_log.line(
+                            "create_response code={}".format(msg[tag]["code"].name)
                         )
-                        sys.stdout.flush()
                         return None
                     cid = msg[tag]["channel_id"]
-                    sys.stdout.write("channel_id {}\n".format(cid))
-                    sys.stdout.flush()
+                    self.session_log.line("channel_id {}".format(cid))
                     return cid
                 if msg[tag]["code"] != rp.status_code.OK:
-                    sys.stdout.write(
-                        "join_response code={}\n".format(msg[tag]["code"].name)
+                    self.session_log.line(
+                        "join_response code={}".format(msg[tag]["code"].name)
                     )
-                    sys.stdout.flush()
                     return None
                 cid = msg[tag]["channel_id"]
-                sys.stdout.write("channel_id {}\n".format(cid))
-                sys.stdout.flush()
+                self.session_log.line("channel_id {}".format(cid))
                 return cid
-        sys.stdout.write("timeout waiting for {}\n".format(kind))
-        sys.stdout.flush()
+        self.session_log.line("timeout waiting for {}".format(kind))
         return None
 
-    def print_pdu(self, pdu: dict[str, Any]) -> None:
-        sys.stdout.write("{}\n".format(pdu))
-        sys.stdout.flush()
-
-    def process_incoming_pdu(
-        self,
-        pdu: dict[str, Any],
-        *,
-        skip_print: bool = False,
-    ) -> None:
+    def process_incoming_pdu(self, pdu: dict[str, Any]) -> None:
         msg = pdu["message"]
+        self.session_log.received(msg)
         tag = message_tag(msg)
-        if pdu.get("session") is not None:
-            self.session_blob = pdu["session"]
         if tag == "heartbeat":
-            if not skip_print:
-                self.print_pdu(pdu)
             return
         if tag == "identity_request":
-            if not skip_print:
-                self.print_pdu(pdu)
             self.handle_identity_request(msg[tag])
             return
         if tag == "ignored_indication":
-            if not skip_print:
-                self.print_pdu(pdu)
             return
-        if not skip_print:
-            self.print_pdu(pdu)
+        if tag == "stream_data":
+            pl = msg[tag].get("payload")
+            if isinstance(pl, list):
+                data = bytes(pl)
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.write(b"\n")
+                sys.stdout.buffer.flush()
+            return
 
     def send_stream_payload(self, line: bytes) -> None:
         if self.channel_id is None:
@@ -243,11 +283,14 @@ class ClientState:
                     "payload": payload,
                 },
             },
-            session=self.session_blob,
         )
 
 
-def recv_pdu(sock: socket.socket, timeout: float) -> Optional[dict[str, Any]]:
+def recv_pdu(
+    sock: socket.socket,
+    timeout: float,
+    session_log: SessionLog,
+) -> Optional[dict[str, Any]]:
     r, _, _ = select.select([sock], [], [], timeout)
     if not r:
         return None
@@ -257,34 +300,48 @@ def recv_pdu(sock: socket.socket, timeout: float) -> Optional[dict[str, Any]]:
     try:
         return pdu_decode(data)
     except CodecError:
-        sys.stderr.write("client: CodecError dropping datagram {} bytes\n".format(len(data)))
+        msg = "client: CodecError dropping datagram {} bytes".format(len(data))
+        session_log.line(msg)
+        sys.stderr.write(msg + "\n")
         return None
 
 
-def handshake(state: ClientState) -> None:
+def handshake(state: ClientState, heartbeat_s: float) -> None:
+    hb = max(0.1, heartbeat_s)
     state.send_heartbeat()
+    next_hb_at = time.monotonic() + hb
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        pdu = recv_pdu(state.sock, min(1.0, deadline - time.monotonic()))
+        now = time.monotonic()
+        recv_timeout = min(1.0, deadline - now, max(0.0, next_hb_at - now))
+        pdu = recv_pdu(
+            state.sock,
+            recv_timeout,
+            state.session_log,
+        )
         if pdu is None:
-            state.send_heartbeat()
+            now = time.monotonic()
+            if now >= next_hb_at:
+                state.send_heartbeat()
+                next_hb_at = now + hb
             continue
         msg = pdu["message"]
         tag = message_tag(msg)
         if tag == "identity_request" and (
             not state.username or state.password == ""
         ):
-            sys.stderr.write(
-                "client: identity required; retry with --username and --password\n"
+            err = (
+                "client: identity required; retry with --username and --password"
             )
+            state.session_log.line(err)
+            sys.stderr.write(err + "\n")
             sys.exit(2)
-        state.process_incoming_pdu(pdu, skip_print=(tag == "heartbeat"))
-        if tag == "identity_request":
-            continue
+        state.process_incoming_pdu(pdu)
         if state.session_blob is not None:
             break
-        # Anonymous transports: optional_session is omitted and the server binds one blob;
-        # we never mirror it locally, but the link is alive after the first heartbeat round-trip.
+        if tag == "identity_request":
+            continue
+        # Anonymous (no username): outer PDU session stays omitted; server maps by transport only.
         if tag == "heartbeat" and not state.username:
             break
 
@@ -293,9 +350,17 @@ def stdin_reader(state: ClientState, stop_evt: threading.Event) -> None:
     while not stop_evt.is_set():
         line = sys.stdin.readline()
         if not line:
+            state.session_log.line("stdin: EOF; stopping stdin reader")
             break
-        if state.channel_id is not None:
-            state.send_stream_payload(line.rstrip("\n").encode())
+        payload = line.rstrip("\n").encode()
+        if state.channel_id is None:
+            state.session_log.line(
+                "stdin: dropped {} bytes; channel_id is not set (join/create missing or failed)".format(
+                    len(payload)
+                )
+            )
+            continue
+        state.send_stream_payload(payload)
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -325,7 +390,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     g.add_argument("--create", metavar="NAME", help='create_request channel_name')
     g.add_argument("--join", metavar="NAME", help="join_request channel_name")
     p.add_argument("--meta", metavar="META", default="", help="channel metadata")
+    p.add_argument(
+        "--heartbeat",
+        "--hearbeat",
+        type=float,
+        default=30.0,
+        dest="heartbeat",
+        metavar="SECONDS",
+        help="heartbeat interval seconds (default: 30)",
+    )
     args = p.parse_args(argv)
+    if args.heartbeat <= 0:
+        p.error("--heartbeat must be > 0")
     args.host, args.port = args.server
     del args.server
     return args
@@ -333,11 +409,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    log_path = pathlib.Path(log_filename_for_user(args.username))
+    session_log = SessionLog(log_path)
+
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("0.0.0.0", 0))
     server_addr = (args.host, args.port)
-    sys.stdout.write("server {}\n".format(server_addr))
-    sys.stdout.flush()
+    session_log.line("server {}".format(server_addr))
 
     state = ClientState(
         udp,
@@ -345,11 +423,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         username=args.username,
         password=args.password,
         metadata=args.meta,
+        session_log=session_log,
     )
 
     stop = threading.Event()
     try:
-        handshake(state)
+        handshake(state, args.heartbeat)
         if args.create:
             state.channel_id = state.run_create(args.create)
         elif args.join:
@@ -357,15 +436,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         threading.Thread(target=stdin_reader, args=(state, stop), daemon=True).start()
 
+        next_hb_at = time.monotonic() + args.heartbeat
         while True:
-            pdu = recv_pdu(udp, 1.0)
+            pdu = recv_pdu(udp, 1.0, session_log)
             if pdu is not None:
                 state.process_incoming_pdu(pdu)
-            elif not state.channel_id:
+            elif not state.channel_id and time.monotonic() >= next_hb_at:
                 state.send_heartbeat()
+                next_hb_at = time.monotonic() + args.heartbeat
     finally:
         stop.set()
         udp.close()
+        session_log.close()
     return 0
 
 

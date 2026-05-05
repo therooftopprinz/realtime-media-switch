@@ -22,7 +22,7 @@ set(RTMS_BFC_GIT_HASH "bd5e0cce68e8aea8adc8e995b1ad23361e425d29"
 set(RTMS_CUM_REPOSITORY "https://github.com/therooftopprinz/cum.git"
     CACHE STRING "Git repo for cum C++ PER runtime (cum/cum.hpp from target_cpp/)")
 
-set(RTMS_CUM_GIT_HASH "bc93bcc0d93a939e9aa5a34ecf1ae2e8276f2052"
+set(RTMS_CUM_GIT_HASH "e0d04b66b3512e14bccfacb730dd7e3421957fe5"
     CACHE STRING "pinned cum.git commit")
 
 FetchContent_Declare(
@@ -55,7 +55,6 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(RTMS_CUM_ROOT "${rtms_deps_cum_SOURCE_DIR}")
 set(RTMS_CUM_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../interface/rtms.cum")
 set(RTMS_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/protocol/rtms.hpp")
-set(RTMS_AST_TO_PY "${CMAKE_CURRENT_SOURCE_DIR}/cmake/rtms_ast_to_py.py")
 set(RTMS_PY_E2E_DIR "${CMAKE_CURRENT_SOURCE_DIR}/e2e_test_py")
 set(RTMS_PROTOCOL_PY "${RTMS_PY_E2E_DIR}/rtms_protocol.py")
 set(RTMS_PY_CUM_MARKER "${RTMS_PY_E2E_DIR}/cum/cum.py")
@@ -87,9 +86,8 @@ add_custom_command(
             "${RTMS_PY_E2E_DIR}/cum"
     COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${RTMS_CUM_ROOT}/generator"
             bash -c
-            "\"${Python3_EXECUTABLE}\" \"${RTMS_CUM_ROOT}/generator/cum_to_ast.py\" \"${RTMS_CUM_FILE}\" | \"${Python3_EXECUTABLE}\" \"${RTMS_AST_TO_PY}\" > \"${RTMS_PROTOCOL_PY}\""
+            "\"${Python3_EXECUTABLE}\" \"${RTMS_CUM_ROOT}/generator/cum_to_ast.py\" \"${RTMS_CUM_FILE}\" | \"${Python3_EXECUTABLE}\" \"${RTMS_CUM_ROOT}/generator/ast_to_py.py\" > \"${RTMS_PROTOCOL_PY}\""
     DEPENDS "${RTMS_CUM_FILE}"
-            "${RTMS_AST_TO_PY}"
             "${RTMS_CUM_ROOT}/generator/cum_to_ast.py"
             "${RTMS_CUM_ROOT}/generator/ast_to_py.py"
             "${RTMS_CUM_ROOT}/generator/ast_normalize.py"
@@ -107,7 +105,7 @@ add_executable(rtms_switch
     src/core/rtms_switch.cpp
     src/utils/transport_endpoint.cpp
     src/transport/udp_transport.cpp
-    src/transport/transport_tx_enqueue.cpp
+    src/utils/transport_tx_enqueue.cpp
     src/utils/hcsv.cpp
     src/utils/hmac_sha256.cpp
     src/utils/rtms_session.cpp

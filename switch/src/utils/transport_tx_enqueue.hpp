@@ -1,5 +1,5 @@
-#ifndef __TRANSPORT_TRANSPORT_TX_ENQUEUE_HPP__
-#define __TRANSPORT_TRANSPORT_TX_ENQUEUE_HPP__
+#ifndef __UTILS_TRANSPORT_TX_ENQUEUE_HPP__
+#define __UTILS_TRANSPORT_TX_ENQUEUE_HPP__
 
 #include <bfc/buffer.hpp>
 
@@ -16,4 +16,4 @@ void enqueue_udp_datagram(transport_in_queue_t& p_tx, utils::cv_reactor_t& p_cv_
 
 } // namespace transport
 
-#endif // __TRANSPORT_TRANSPORT_TX_ENQUEUE_HPP__
+#endif // __UTILS_TRANSPORT_TX_ENQUEUE_HPP__

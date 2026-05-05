@@ -22,12 +22,14 @@ session_data_ptr_t session_manager::create_session(session_id_t const& p_session
     if (it_existing != m_sessions.end())
     {
         it_existing->second->transport_key = p_transport_key;
+        it_existing->second->session_id    = utils::clone_session_id(p_session_id);
         return it_existing->second;
     }
 
     session_data_ptr_t const data = std::make_shared<session_data_s>();
     data->transport_key = p_transport_key;
     data->username      = p_username;
+    data->session_id    = utils::clone_session_id(p_session_id);
     /** emplace clones the session id so we never copy/move `cum::session` keys in the map API. */
     m_sessions.emplace(utils::clone_session_id(p_session_id), data);
     return data;

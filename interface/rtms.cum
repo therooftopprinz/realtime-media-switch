@@ -1,11 +1,11 @@
 using bytes            = dynamic<u8, 2048>;
-using optional_bytes   = optional<bytes>;
 using session          = static<u8, 16>;
 using optional_session = optional<session>;
 
 enumeration status_code
 {
     OK,                     // all response
+    EXIST,                  // create_response
     NOT_FOUND,              // join_response, leave_response
     META_MISMATCH,          // join_response
 };
@@ -132,8 +132,8 @@ choice messages
 
 sequence rtms
 {
-    u8             protocol_version;
-    u64            sender_ts_us;
-    optional_bytes session;
-    messages       message;
+    u8               protocol_version;
+    u64              sender_ts_us;
+    optional_session session;
+    messages         message;
 };

@@ -1,0 +1,19 @@
+++ ffmpeg -loglevel error -re -f lavfi -i testsrc=size=160x120:rate=10 -t 3 -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -f mpegts -
+++ stdbuf -i0 -o0 python3 -c 'import base64,sys
+CHUNK=512
+while True:
+ b=sys.stdin.buffer.read(CHUNK)
+ if not b: break
+ sys.stdout.buffer.write(base64.b64encode(b)+b"\n"); sys.stdout.buffer.flush()
+'
+++ python3 /home/ubuntu/development/realtime-media-switch/switch/e2e_test_py/client.py --server 127.0.0.1:50000 --username juan --password tamad --create manual_e2e_43285 --heartbeat 30
+0
+--: line 18: 43303 Done                    ffmpeg -loglevel error -re -f lavfi -i testsrc=size=160x120:rate=10 -t 3 -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -f mpegts - 2> /dev/null
+     43305                       | stdbuf -i0 -o0 python3 -c "import base64,sys
+CHUNK=512
+while True:
+ b=sys.stdin.buffer.read(CHUNK)
+ if not b: break
+ sys.stdout.buffer.write(base64.b64encode(b)+b\"\\n\"); sys.stdout.buffer.flush()
+"
+     43306 Killed                  | python3 "$REPO/switch/e2e_test_py/client.py" --server 127.0.0.1:50000 --username juan --password tamad --create "$CH" --heartbeat 30
