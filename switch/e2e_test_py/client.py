@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-RTMS UDP test client — stdin/stdout carry stream_data payloads only once on a channel;
-all other diagnostics and PDU traffic go to username_YYYY_MM_DD_HH_mm_SS.log.
+RTMS UDP test client — stdin/stdout carry stream_data payloads on a channel.
+
+Default (text mode): stdin is line-based; each non-empty line becomes one payload (capped by
+--max-stream-payload, split across PDUs if longer). Received stream_data is written to stdout
+plus a newline.
+
+With --binary-stream: stdin/stdout are raw bytes (e.g. gst-launch-1.0 RTP over a pipe). Each
+UDP PDU caps payload at --max-stream-payload bytes; the client fragments on send. Received
+PDUs are written to stdout in arrival order. Individual stream_data PDUs are not written to
+<username>.log (disk flush was starving recv).
+Tip: when feeding RTP from rtph264pay mtu=N, set --max-stream-payload to N (e.g. 1250) so one
+RTP packet maps to one UDP PDU on the wire to the switch.
+Binary stream_data to stdout is handled on a separate thread with a queue so the UDP recv loop
+never blocks on a full pipe to gst-launch (a common failure mode with  python3 -u  on subscriber).
+
+Use a different RTMS identity per client: --username / --password. Logs go to <username>.log .
 """
 from __future__ import annotations
 
@@ -10,6 +24,7 @@ import datetime as dt
 import hashlib
 import hmac
 import pathlib
+import queue
 import select
 import socket
 import sys
@@ -122,6 +137,9 @@ def hmac_challenge_response(password: str, challenge: list[int]) -> list[int]:
     return list(hmac.new(key, msg, hashlib.sha256).digest())
 
 
+_DEFAULT_MAX_STREAM_PAYLOAD = 2048
+
+
 class ClientState:
     def __init__(
         self,
@@ -132,6 +150,8 @@ class ClientState:
         password: str,
         metadata: str,
         session_log: SessionLog,
+        binary_stream: bool = False,
+        max_stream_payload: int = _DEFAULT_MAX_STREAM_PAYLOAD,
     ):
         self.sock = sock
         self.server_addr = server_addr
@@ -139,10 +159,20 @@ class ClientState:
         self.password = password
         self.metadata = metadata
         self.session_log = session_log
+        self.binary_stream = binary_stream
+        self.max_stream_payload = max_stream_payload
+        self._binary_stdout_q: Optional[queue.SimpleQueue[bytes]] = (
+            queue.SimpleQueue() if binary_stream else None
+        )
         self.next_req_id = 1
         self.session_blob: Optional[list[int]] = None
         self.channel_id: Optional[int] = None
         self._lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self.rx_stream_pdus = 0
+        self.rx_stream_bytes = 0
+        self.tx_stream_pdus = 0
+        self.tx_stream_bytes = 0
 
     def next_id(self) -> int:
         with self._lock:
@@ -153,7 +183,8 @@ class ClientState:
             return rid
 
     def send_pdu(self, message: dict) -> None:
-        self.session_log.sent(message)
+        if not (self.binary_stream and message_tag(message) == "stream_data"):
+            self.session_log.sent(message)
         # Outer PDU `session` (16 bytes): absent until negotiated via identity_request /
         # identity_response; server routes by transport until then, then by session id if set.
         pdu: dict[str, Any] = {
@@ -185,7 +216,7 @@ class ClientState:
     def authenticated(self, username: Optional[str]) -> None:
         if not username or self.password == "":
             msg = (
-                "client: --create/--join require --username and --password "
+                "client: --channel requires --username and --password "
                 "when identity is enforced"
             )
             self.session_log.line(msg)
@@ -215,7 +246,37 @@ class ClientState:
         self.send_pdu({"join_request": jr})
         return self.await_response(("join_response", rid))
 
+    def run_channel(self, channel_name: str) -> Optional[int]:
+        cid, code = self.run_join_with_code(channel_name)
+        if cid is not None:
+            return cid
+        if code == rp.status_code.NOT_FOUND:
+            self.session_log.line(
+                "join_response code=NOT_FOUND; creating channel '{}'".format(channel_name)
+            )
+            return self.run_create(channel_name)
+        return None
+
+    def run_join_with_code(
+        self, channel_name: str
+    ) -> tuple[Optional[int], Optional[rp.status_code]]:
+        self.authenticated(self.username)
+        rid = self.next_id()
+        jr = {
+            "req_id": rid,
+            "channel_name": channel_name,
+            "metadata": self.metadata,
+        }
+        self.send_pdu({"join_request": jr})
+        return self.await_response_with_code(("join_response", rid))
+
     def await_response(self, expect: tuple[str, int]) -> Optional[int]:
+        cid, _ = self.await_response_with_code(expect)
+        return cid
+
+    def await_response_with_code(
+        self, expect: tuple[str, int]
+    ) -> tuple[Optional[int], Optional[rp.status_code]]:
         kind, rid = expect
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
@@ -230,30 +291,32 @@ class ClientState:
             msg = pdu["message"]
             tag = message_tag(msg)
             if tag == kind and msg[tag]["req_id"] == rid:
+                code = msg[tag]["code"]
                 if tag == "create_response":
-                    if msg[tag]["code"] != rp.status_code.OK:
+                    if code != rp.status_code.OK:
                         self.session_log.line(
-                            "create_response code={}".format(msg[tag]["code"].name)
+                            "create_response code={}".format(code.name)
                         )
-                        return None
+                        return None, code
                     cid = msg[tag]["channel_id"]
                     self.session_log.line("channel_id {}".format(cid))
-                    return cid
-                if msg[tag]["code"] != rp.status_code.OK:
+                    return cid, code
+                if code != rp.status_code.OK:
                     self.session_log.line(
-                        "join_response code={}".format(msg[tag]["code"].name)
+                        "join_response code={}".format(code.name)
                     )
-                    return None
+                    return None, code
                 cid = msg[tag]["channel_id"]
                 self.session_log.line("channel_id {}".format(cid))
-                return cid
+                return cid, code
         self.session_log.line("timeout waiting for {}".format(kind))
-        return None
+        return None, None
 
     def process_incoming_pdu(self, pdu: dict[str, Any]) -> None:
         msg = pdu["message"]
-        self.session_log.received(msg)
         tag = message_tag(msg)
+        if not (self.binary_stream and tag == "stream_data"):
+            self.session_log.received(msg)
         if tag == "heartbeat":
             return
         if tag == "identity_request":
@@ -265,25 +328,56 @@ class ClientState:
             pl = msg[tag].get("payload")
             if isinstance(pl, list):
                 data = bytes(pl)
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.write(b"\n")
-                sys.stdout.buffer.flush()
+                with self._stats_lock:
+                    self.rx_stream_pdus += 1
+                    self.rx_stream_bytes += len(data)
+                if self.binary_stream:
+                    assert self._binary_stdout_q is not None
+                    self._binary_stdout_q.put(data)
+                else:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
             return
 
-    def send_stream_payload(self, line: bytes) -> None:
+    def send_stream_bytes(self, data: bytes) -> None:
+        """Send arbitrary bytes; fragments into max_stream_payload-byte stream_data PDUs."""
         if self.channel_id is None:
             return
-        pay = min(len(line), 2048)
-        payload = list(line[:pay])
-        self.send_pdu(
-            {
-                "stream_data": {
-                    "from_username": "",
-                    "channel_id": self.channel_id,
-                    "payload": payload,
+        off = 0
+        n = len(data)
+        cap = self.max_stream_payload
+        while off < n:
+            piece = data[off : off + cap]
+            off += len(piece)
+            self.send_pdu(
+                {
+                    "stream_data": {
+                        "from_username": "",
+                        "channel_id": self.channel_id,
+                        "payload": list(piece),
+                    },
                 },
-            },
-        )
+            )
+            with self._stats_lock:
+                self.tx_stream_pdus += 1
+                self.tx_stream_bytes += len(piece)
+
+    def snapshot_and_reset_stats(self) -> tuple[int, int, int, int]:
+        """Atomically read tx/rx counters since last call and zero them."""
+        with self._stats_lock:
+            tx_p = self.tx_stream_pdus
+            tx_b = self.tx_stream_bytes
+            rx_p = self.rx_stream_pdus
+            rx_b = self.rx_stream_bytes
+            self.tx_stream_pdus = 0
+            self.tx_stream_bytes = 0
+            self.rx_stream_pdus = 0
+            self.rx_stream_bytes = 0
+        return tx_p, tx_b, rx_p, rx_b
+
+    def send_stream_payload(self, line: bytes) -> None:
+        """One logical line from text stdin (caller strips newline)."""
+        self.send_stream_bytes(line)
 
 
 def recv_pdu(
@@ -355,12 +449,62 @@ def stdin_reader(state: ClientState, stop_evt: threading.Event) -> None:
         payload = line.rstrip("\n").encode()
         if state.channel_id is None:
             state.session_log.line(
-                "stdin: dropped {} bytes; channel_id is not set (join/create missing or failed)".format(
+                "stdin: dropped {} bytes; channel_id is not set (--channel missing or failed)".format(
                     len(payload)
                 )
             )
             continue
         state.send_stream_payload(payload)
+
+
+def binary_stdout_writer(
+    stop_evt: threading.Event,
+    q: "queue.SimpleQueue[bytes]",
+) -> None:
+    """Write RTP chunks to stdout on a background thread so UDP recv never blocks on a full pipe."""
+    while True:
+        try:
+            data = q.get(timeout=0.3)
+        except queue.Empty:
+            if stop_evt.is_set():
+                break
+            continue
+        sys.stdout.buffer.write(data)
+    while True:
+        try:
+            sys.stdout.buffer.write(q.get_nowait())
+        except queue.Empty:
+            break
+    try:
+        sys.stdout.buffer.flush()
+    except BrokenPipeError:
+        pass
+
+
+def binary_stdin_reader(
+    state: ClientState,
+    stop_evt: threading.Event,
+    read_chunk: int,
+) -> None:
+    """Read binary chunks from stdin (e.g. RTP from gst-launch); send as stream_data PDUs.
+
+    `read_chunk` should be modest (e.g. 4k–8k): a blocking read(65536) waits until 64 KiB
+    exist on the pipe, which at video bitrates can be ~0.3–3 s between bursts—subscribers then
+    see sparse `stream_data` in logs even though the switch forwards each PDU immediately.
+    """
+    while not stop_evt.is_set():
+        chunk = sys.stdin.buffer.read(read_chunk)
+        if not chunk:
+            state.session_log.line("stdin: EOF; stopping binary stdin reader")
+            break
+        if state.channel_id is None:
+            state.session_log.line(
+                "stdin: dropped {} bytes; channel_id is not set (--channel missing or failed)".format(
+                    len(chunk)
+                )
+            )
+            continue
+        state.send_stream_bytes(chunk)
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -386,9 +530,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="PASSWORD",
         help='identity password',
     )
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--create", metavar="NAME", help='create_request channel_name')
-    g.add_argument("--join", metavar="NAME", help="join_request channel_name")
+    p.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="join channel if it exists; otherwise create it",
+    )
     p.add_argument("--meta", metavar="META", default="", help="channel metadata")
     p.add_argument(
         "--heartbeat",
@@ -399,9 +545,47 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="SECONDS",
         help="heartbeat interval seconds (default: 30)",
     )
+    p.add_argument(
+        "--binary-stream",
+        action="store_true",
+        help="raw stdin/stdout for byte streams (e.g. gst-launch RTP); no line breaks on stdout",
+    )
+    p.add_argument(
+        "--binary-read-chunk",
+        type=int,
+        metavar="BYTES",
+        default=8192,
+        help="with --binary-stream: max bytes per stdin read (default: 8192). "
+        "Avoid huge values (e.g. 65536): they block until that many bytes arrive and make "
+        "sends bursty.",
+    )
+    p.add_argument(
+        "--max-stream-payload",
+        type=int,
+        metavar="BYTES",
+        default=_DEFAULT_MAX_STREAM_PAYLOAD,
+        help="cap on stream_data payload bytes per UDP PDU (default: {}). With gst "
+        "rtph264pay mtu=N, set this to N (e.g. 1250) so one RTP packet -> one PDU.".format(
+            _DEFAULT_MAX_STREAM_PAYLOAD
+        ),
+    )
+    p.add_argument(
+        "--stream-stats-interval",
+        type=float,
+        metavar="SECONDS",
+        default=1.0,
+        help="period for tx/rx stream_data stats line (default: 1.0). "
+        "Always logged to <username>.log; set 0 to disable.",
+    )
     args = p.parse_args(argv)
     if args.heartbeat <= 0:
         p.error("--heartbeat must be > 0")
+    if args.binary_read_chunk < 1 or args.binary_read_chunk > 65535:
+        p.error("--binary-read-chunk must be in 1..65535")
+    if args.max_stream_payload < 1 or args.max_stream_payload > 65535:
+        p.error("--max-stream-payload must be in 1..65535")
+    if args.stream_stats_interval < 0:
+        p.error("--stream-stats-interval must be >= 0")
     args.host, args.port = args.server
     del args.server
     return args
@@ -414,6 +598,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("0.0.0.0", 0))
+    # Large buffers reduce drops when Python briefly falls behind (e.g. CPU scheduling).
+    for which, name in (
+        (socket.SO_RCVBUF, "SO_RCVBUF"),
+        (socket.SO_SNDBUF, "SO_SNDBUF"),
+    ):
+        try:
+            udp.setsockopt(socket.SOL_SOCKET, which, 8 * 1024 * 1024)
+        except OSError as e:
+            session_log.line("note: could not set {} ({}): {}".format(name, 8 * 1024 * 1024, e))
     server_addr = (args.host, args.port)
     session_log.line("server {}".format(server_addr))
 
@@ -424,28 +617,69 @@ def main(argv: Optional[list[str]] = None) -> int:
         password=args.password,
         metadata=args.meta,
         session_log=session_log,
+        binary_stream=args.binary_stream,
+        max_stream_payload=args.max_stream_payload,
     )
 
     stop = threading.Event()
+    writer_thread: Optional[threading.Thread] = None
     try:
         handshake(state, args.heartbeat)
-        if args.create:
-            state.channel_id = state.run_create(args.create)
-        elif args.join:
-            state.channel_id = state.run_join(args.join)
+        if args.channel:
+            state.channel_id = state.run_channel(args.channel)
 
-        threading.Thread(target=stdin_reader, args=(state, stop), daemon=True).start()
+        if args.binary_stream:
+            assert state._binary_stdout_q is not None
+            writer_thread = threading.Thread(
+                target=binary_stdout_writer,
+                args=(stop, state._binary_stdout_q),
+                daemon=True,
+            )
+            writer_thread.start()
+            threading.Thread(
+                target=binary_stdin_reader,
+                args=(state, stop, args.binary_read_chunk),
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(target=stdin_reader, args=(state, stop), daemon=True).start()
 
         next_hb_at = time.monotonic() + args.heartbeat
+        if args.binary_stream:
+            session_log.line(
+                "binary-stream: not logging each stream_data PDU to this file (throughput)"
+            )
+        stats_interval = args.stream_stats_interval if args.stream_stats_interval > 0 else 0.0
+        if 0.0 < stats_interval < 0.1:
+            stats_interval = 0.1
+        next_stats_at = time.monotonic() + stats_interval if stats_interval > 0 else None
         while True:
             pdu = recv_pdu(udp, 1.0, session_log)
             if pdu is not None:
-                state.process_incoming_pdu(pdu)
+                while True:
+                    state.process_incoming_pdu(pdu)
+                    if not state.binary_stream:
+                        break
+                    pdu = recv_pdu(udp, 0.0, session_log)
+                    if pdu is None:
+                        break
             elif not state.channel_id and time.monotonic() >= next_hb_at:
                 state.send_heartbeat()
                 next_hb_at = time.monotonic() + args.heartbeat
+            if next_stats_at is not None and time.monotonic() >= next_stats_at:
+                tx_p, tx_b, rx_p, rx_b = state.snapshot_and_reset_stats()
+                if tx_p or tx_b or rx_p or rx_b:
+                    line = (
+                        "stream stats[{:.1f}s]: tx {} PDUs / {} B  |  rx {} PDUs / {} B".format(
+                            stats_interval, tx_p, tx_b, rx_p, rx_b
+                        )
+                    )
+                    session_log.line(line)
+                next_stats_at = time.monotonic() + stats_interval
     finally:
         stop.set()
+        if writer_thread is not None:
+            writer_thread.join(timeout=10.0)
         udp.close()
         session_log.close()
     return 0

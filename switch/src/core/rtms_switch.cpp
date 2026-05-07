@@ -749,13 +749,11 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
         return;
     }
 
-    std::string pdu_json;
-    cum::str(nullptr, pdu, pdu_json, true);
-    LOG(utils::DBG, "rtms_switch::stream_data | sending from %s(%s) to channel=%s msg=%s",
+    LOG(utils::DBG, "rtms_switch::stream_data | sending from %s(%s) to channel=%s size=%zu",
         utils::transport_endpoint_key_to_string(p_transport).c_str(),
         sender->username.c_str(),
         ch.name.c_str(),
-        pdu_json.c_str());
+        sd.payload.size());
 
     auto const view = bfc::const_buffer_view(wire.data(), nbytes);
 
@@ -792,10 +790,13 @@ void rtms_switch::on_message(transport_endpoint_key_t const& p_transport, bfc::b
         return;
     }
 
-    std::string pdu_json;
-    cum::str(nullptr, pdu, pdu_json, true);
-    LOG(utils::INF, "rtms_switch::on_message | from_endpoint=%s msg=%s",
-        utils::transport_endpoint_key_to_string(p_transport).c_str(), pdu_json.c_str());
+    if (!std::holds_alternative<cum::stream_data>(pdu.message))
+    {
+        std::string pdu_json;
+        cum::str(nullptr, pdu, pdu_json, true);
+        LOG(utils::INF, "rtms_switch::on_message | from_endpoint=%s msg=%s",
+            utils::transport_endpoint_key_to_string(p_transport).c_str(), pdu_json.c_str());
+    }
 
     session_data_ptr_t rx_sess{};
     if (std::holds_alternative<cum::identity_response>(pdu.message))

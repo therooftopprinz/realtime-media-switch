@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import pathlib
 import socket
+import json
 from aiohttp import web, WSMsgType
 
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -108,18 +109,35 @@ async def websocket_rtms_udp(
     return ws
 
 
-async def index(_: web.Request) -> web.FileResponse:
-    return web.FileResponse(_ROOT / "webapp.html")
+async def loopback_h264(_: web.Request) -> web.FileResponse:
+    return web.FileResponse(_ROOT / "loopbackh264.html")
 
 
-def make_app(*, switch_addr: tuple[str, int]) -> web.Application:
+def normalize_base_path(s: str) -> str:
+    s = (s or "").strip()
+    if not s or s == "/":
+        return ""
+    if not s.startswith("/"):
+        s = "/" + s
+    s = s.rstrip("/")
+    return s
+
+
+def make_app(*, switch_addr: tuple[str, int], base_path: str) -> web.Application:
     app = web.Application()
     app["switch_addr"] = switch_addr
+    app["base_path"] = base_path
 
     async def _ws(request: web.Request) -> web.StreamResponse:
         return await websocket_rtms_udp(request, app["switch_addr"])
 
-    app.router.add_get("/", index)
+    async def _index(_: web.Request) -> web.Response:
+        html = (_ROOT / "webapp.html").read_text(encoding="utf-8")
+        html = html.replace("__BASE_URL__", json.dumps(app["base_path"]))
+        return web.Response(text=html, content_type="text/html")
+
+    app.router.add_get("/", _index)
+    app.router.add_get("/loopbackh264.html", loopback_h264)
     app.router.add_get("/ws", _ws)
 
     js_dir = _ROOT / "js"
@@ -134,7 +152,12 @@ def make_app(*, switch_addr: tuple[str, int]) -> web.Application:
 
     app.router.add_get("/app.mjs", _app_js)
 
-    return app
+    if not base_path:
+        return app
+
+    root = web.Application()
+    root.add_subapp(base_path, app)
+    return root
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -156,6 +179,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: 127.0.0.1:50000 per transport.local.port in config.cfg)"
         ),
     )
+    p.add_argument(
+        "--base-path",
+        default="",
+        help=(
+            "URL base path prefix when running behind a reverse proxy "
+            '(example: "/rtms"). Default: no prefix.'
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -165,11 +196,15 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     listen_host, listen_port = args.listen
     switch_addr = args.connect
+    base_path = normalize_base_path(args.base_path)
 
-    app = make_app(switch_addr=switch_addr)
+    app = make_app(switch_addr=switch_addr, base_path=base_path)
     print(
-        f"RTMS web_sample: http://{listen_host}:{listen_port}/ "
-        f"(ws /ws → udp {switch_addr[0]}:{switch_addr[1]})",
+        (
+            f"RTMS web_sample: http://{listen_host}:{listen_port}{base_path or '/'} "
+            f"(ws {(base_path + '/ws') if base_path else '/ws'} "
+            f"→ udp {switch_addr[0]}:{switch_addr[1]})"
+        ),
         file=sys.stderr,
     )
     web.run_app(

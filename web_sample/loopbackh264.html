@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>H264 Loopback Debug</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 12px;
+      font-family: system-ui, sans-serif;
+      background: #f4f6f8;
+      color: #111827;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    label { font-size: 12px; color: #4b5563; font-family: ui-monospace, monospace; }
+    select, input, button {
+      padding: 8px 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      font-size: 14px;
+      background: #fff;
+    }
+    button {
+      cursor: pointer;
+      background: #4f46e5;
+      color: #fff;
+      border: none;
+    }
+    button.secondary { background: #4b5563; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status {
+      min-height: 1.2em;
+      font-size: 12px;
+      font-family: ui-monospace, monospace;
+      color: #1f2937;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .pane {
+      background: #fff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 8px;
+    }
+    .pane h3 {
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    canvas {
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #111;
+      border-radius: 6px;
+      border: 1px solid #374151;
+    }
+    #debug {
+      margin: 0;
+      font-size: 12px;
+      color: #374151;
+      white-space: pre-wrap;
+      background: #fff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <div class="field">
+      <label for="sourceType">Source</label>
+      <select id="sourceType">
+        <option value="camera">Camera</option>
+        <option value="screen">Screenshare</option>
+      </select>
+    </div>
+    <button id="btnStart" type="button">Start</button>
+    <button id="btnStop" type="button" class="secondary" disabled>Stop</button>
+  </div>
+  <div id="status">Idle.</div>
+  <div class="layout">
+    <section class="pane">
+      <h3>Direct frame canvas (source)</h3>
+      <canvas id="sourceCanvas" width="640" height="360"></canvas>
+    </section>
+    <section class="pane">
+      <h3>Loopback frame canvas (encode -> queue -> decode)</h3>
+      <canvas id="loopCanvas" width="640" height="360"></canvas>
+    </section>
+  </div>
+  <pre id="debug"></pre>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const sourceTypeSel = $("sourceType");
+    const btnStart = $("btnStart");
+    const btnStop = $("btnStop");
+    const statusEl = $("status");
+    const debugEl = $("debug");
+    const sourceCanvas = $("sourceCanvas");
+    const loopCanvas = $("loopCanvas");
+    const sourceCtx = sourceCanvas.getContext("2d");
+    const loopCtx = loopCanvas.getContext("2d");
+
+    let running = false;
+    let mediaStream = null;
+    let rafId = null;
+    let encoder = null;
+    let decoder = null;
+    let encoderReady = false;
+    let decoderReady = false;
+    let currentCodec = "avc1.42E01E";
+    let frameCounter = 0;
+    let encodedCount = 0;
+    let decodedCount = 0;
+
+    /** @type {EncodedVideoChunk[]} */
+    const encodeQueue = [];
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    function setDebug() {
+      debugEl.textContent =
+        `running=${running}\n` +
+        `codec=${currentCodec}\n` +
+        `encoded=${encodedCount}\n` +
+        `decoded=${decodedCount}\n` +
+        `queueDepth=${encodeQueue.length}\n`;
+    }
+
+    function showCanvasFrame(ctx, canvas, frame) {
+      const w = frame.displayWidth || frame.codedWidth || canvas.width;
+      const h = frame.displayHeight || frame.codedHeight || canvas.height;
+      if (w && h && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    }
+
+    function concatU8(chunks) {
+      let size = 0;
+      for (const c of chunks) size += c.length;
+      const out = new Uint8Array(size);
+      let off = 0;
+      for (const c of chunks) {
+        out.set(c, off);
+        off += c.length;
+      }
+      return out;
+    }
+
+    function configureLoopDecoder(codec, description) {
+      if (!window.VideoDecoder) throw new Error("VideoDecoder unsupported in this browser");
+      if (decoder) {
+        try { decoder.close(); } catch (_) {}
+      }
+      decoderReady = false;
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          try {
+            showCanvasFrame(loopCtx, loopCanvas, frame);
+            decodedCount++;
+            setDebug();
+          } finally {
+            frame.close();
+          }
+        },
+        error: (e) => {
+          setStatus(`Loop decoder error: ${e.message || e}`);
+        },
+      });
+      const cfg = { codec, optimizeForLatency: true };
+      if (description) cfg.description = description;
+      decoder.configure(cfg);
+      decoderReady = true;
+      currentCodec = codec;
+      setStatus(`Loop decoder configured with ${codec}`);
+      setDebug();
+    }
+
+    function configureEncoder(width, height) {
+      if (!window.VideoEncoder) throw new Error("VideoEncoder unsupported in this browser");
+      if (encoder) {
+        try { encoder.close(); } catch (_) {}
+      }
+      encoderReady = false;
+      encoder = new VideoEncoder({
+        output: (chunk, meta) => {
+          const bytes = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(bytes);
+          const copy = new EncodedVideoChunk({
+            type: chunk.type,
+            timestamp: chunk.timestamp,
+            duration: chunk.duration,
+            data: bytes,
+          });
+          encodeQueue.push(copy);
+          encodedCount++;
+
+          const cfg = meta?.decoderConfig;
+          if (cfg?.codec && !decoderReady) {
+            configureLoopDecoder(cfg.codec, cfg.description);
+          }
+          setDebug();
+        },
+        error: (e) => {
+          setStatus(`Encoder error: ${e.message || e}`);
+        },
+      });
+      encoder.configure({
+        codec: "avc1.42E01E",
+        width,
+        height,
+        bitrate: 1_500_000,
+        framerate: 30,
+        avc: { format: "avc" },
+        latencyMode: "realtime",
+      });
+      encoderReady = true;
+      setStatus("Encoder configured.");
+    }
+
+    function consumeQueue() {
+      if (!running || !decoderReady || !decoder) return;
+      while (encodeQueue.length) {
+        const chunk = encodeQueue.shift();
+        try {
+          decoder.decode(chunk);
+        } catch (e) {
+          setStatus(`Decode failed: ${e.message || e}`);
+          break;
+        }
+      }
+      setDebug();
+    }
+
+    function encodeFromCanvas() {
+      if (!running || !encoderReady || !encoder) return;
+      const ts = Math.floor(performance.now() * 1000);
+      const frame = new VideoFrame(sourceCanvas, { timestamp: ts });
+      const keyEvery = 60;
+      const keyFrame = frameCounter % keyEvery === 0;
+      frameCounter++;
+      try {
+        encoder.encode(frame, { keyFrame });
+      } finally {
+        frame.close();
+      }
+    }
+
+    function stopWebcamLoop() {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      if (mediaStream) {
+        for (const t of mediaStream.getTracks()) t.stop();
+      }
+      mediaStream = null;
+    }
+
+    async function runCameraSource() {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 360, frameRate: 30 },
+        audio: false,
+      });
+      const v = document.createElement("video");
+      v.srcObject = mediaStream;
+      v.muted = true;
+      v.playsInline = true;
+      await v.play();
+
+      const draw = () => {
+        if (!running) return;
+        sourceCtx.drawImage(v, 0, 0, sourceCanvas.width, sourceCanvas.height);
+        encodeFromCanvas();
+        consumeQueue();
+        rafId = requestAnimationFrame(draw);
+      };
+      draw();
+    }
+
+    async function runScreenSource() {
+      mediaStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: false,
+      });
+      const v = document.createElement("video");
+      v.srcObject = mediaStream;
+      v.muted = true;
+      v.playsInline = true;
+      await v.play();
+
+      const draw = () => {
+        if (!running) return;
+        sourceCtx.drawImage(v, 0, 0, sourceCanvas.width, sourceCanvas.height);
+        encodeFromCanvas();
+        consumeQueue();
+        rafId = requestAnimationFrame(draw);
+      };
+      draw();
+    }
+
+    async function start() {
+      if (running) return;
+      if (!window.VideoEncoder || !window.VideoDecoder) {
+        setStatus("This browser needs WebCodecs (VideoEncoder + VideoDecoder).");
+        return;
+      }
+      running = true;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      encodedCount = 0;
+      decodedCount = 0;
+      frameCounter = 0;
+      encodeQueue.length = 0;
+      setDebug();
+
+      try {
+        configureEncoder(sourceCanvas.width, sourceCanvas.height);
+        const sourceType = sourceTypeSel.value;
+        if (sourceType === "camera") {
+          await runCameraSource();
+          setStatus("Running camera -> H264 loopback.");
+        } else {
+          await runScreenSource();
+          setStatus("Running screenshare -> H264 loopback.");
+        }
+      } catch (e) {
+        setStatus(`Start failed: ${e.message || e}`);
+        stop();
+      }
+    }
+
+    function stop() {
+      running = false;
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      stopWebcamLoop();
+      if (encoder) {
+        try { encoder.close(); } catch (_) {}
+      }
+      encoder = null;
+      if (decoder) {
+        try { decoder.close(); } catch (_) {}
+      }
+      decoder = null;
+      encoderReady = false;
+      decoderReady = false;
+      encodeQueue.length = 0;
+      setDebug();
+      setStatus("Stopped.");
+    }
+
+    btnStart.addEventListener("click", start);
+    btnStop.addEventListener("click", stop);
+    setDebug();
+  </script>
+</body>
+</html>

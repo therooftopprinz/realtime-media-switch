@@ -116,22 +116,48 @@
       font-family: inherit;
       font-size: 14px;
     }
-    .media-panel { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+    .media-panel {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      align-items: start;
+    }
     .video-slot {
       position: relative;
       background: #111;
       border-radius: 6px;
       overflow: hidden;
       max-width: 100%;
+      width: 100%;
+      cursor: pointer;
     }
-    .video-slot video {
+    .video-slot video,
+    .video-slot canvas {
       display: block;
       width: 100%;
       height: auto;
       max-height: 240px;
+      object-fit: contain;
     }
-    .video-slot.maximized { width: min(920px, 100%); flex: none; margin: auto; z-index: 2; }
-    .video-slot.maximized video { max-height: 560px; }
+    .video-slot.maximized { grid-column: 1 / -1; z-index: 2; }
+    .video-slot.maximized video,
+    .video-slot.maximized canvas {
+      width: min(100%, 1200px);
+      height: auto;
+      max-height: min(78vh, 760px);
+      margin: 0 auto;
+      object-fit: contain;
+    }
+    .video-slot-caption {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(0,0,0,.55);
+      color: #eee;
+      font-size: 11px;
+      padding: 2px 6px;
+    }
     .lists { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
     .list-box {
       border: 1px solid #e5e7eb;
@@ -154,6 +180,12 @@
 <body>
   <div class="row">
     <div class="field grow">
+      <label class="small" for="savedUsers">Saved logins</label>
+      <select id="savedUsers">
+        <option value="">(none)</option>
+      </select>
+    </div>
+    <div class="field grow">
       <label class="small" for="username">Username</label>
       <input id="username" type="text" autocomplete="username" />
     </div>
@@ -161,6 +193,8 @@
       <label class="small" for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" />
     </div>
+    <button type="button" class="secondary" id="btnDeleteSaved">Delete Saved</button>
+    <button type="button" class="danger" id="btnClearSaved">Clear Saved</button>
     <button type="button" id="btnConnect">Connect</button>
     <button type="button" class="secondary" id="btnDisconnect" disabled>Disconnect</button>
   </div>
@@ -183,7 +217,7 @@
   </div>
 
   <dialog id="dlgAdd">
-    <h3 style="margin-top: 0;">Create or join channel</h3>
+    <h3 style="margin-top: 0;">Add channel</h3>
     <div class="field" style="width:100%; margin-bottom:8px;">
       <label class="small" for="chName">Name</label>
       <input id="chName" type="text" required />
@@ -205,20 +239,15 @@
         <option value="screen">Screen capture</option>
       </select>
     </div>
-    <div class="row" style="margin-top:10px;">
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
-        <input type="radio" name="cj" value="create" checked /> Create
-      </label>
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
-        <input type="radio" name="cj" value="join" /> Join
-      </label>
-    </div>
     <div class="dialog-buttons">
       <button type="button" class="secondary" id="btnAddCancel">Cancel</button>
       <button type="button" id="btnAddOk">OK</button>
     </div>
   </dialog>
 
-  <script type="module" src="/app.mjs"></script>
+  <script>
+    window.RTMS_BASE_URL = __BASE_URL__;
+  </script>
+  <script type="module" src="./app.mjs"></script>
 </body>
 </html>

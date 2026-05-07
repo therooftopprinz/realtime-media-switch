@@ -8,6 +8,8 @@
 #include <array>
 #include <arpa/inet.h>
 #include <cstring>
+#include <cerrno>
+#include <cstring>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
@@ -197,13 +199,33 @@ void udp_transport::on_queue_input_available()
                 using T = std::decay_t<decltype(p_x)>;
                 if constexpr (std::is_same_v<T, transport4_data_s>)
                 {
-                    (void)m_socket.send(p_x.data, 0, reinterpret_cast<sockaddr*>(&p_x.address),
+                    size_t const nbytes = p_x.data.size();
+                    ssize_t const sn = m_socket.send(p_x.data, 0, reinterpret_cast<sockaddr*>(&p_x.address),
                         sizeof(p_x.address));
+                    if (sn < 0)
+                    {
+                        LOG(utils::WRN, "udp_transport: sendto ipv4 failed nbytes=%zu errno=%d (%s)", nbytes, errno,
+                            std::strerror(errno));
+                    }
+                    else if (static_cast<size_t>(sn) != nbytes)
+                    {
+                        LOG(utils::WRN, "udp_transport: sendto ipv4 partial sent=%zd expected=%zu", sn, nbytes);
+                    }
                 }
                 else if constexpr (std::is_same_v<T, transport6_data_s>)
                 {
-                    (void)m_socket.send(p_x.data, 0, reinterpret_cast<sockaddr*>(&p_x.address),
+                    size_t const nbytes = p_x.data.size();
+                    ssize_t const sn = m_socket.send(p_x.data, 0, reinterpret_cast<sockaddr*>(&p_x.address),
                         sizeof(p_x.address));
+                    if (sn < 0)
+                    {
+                        LOG(utils::WRN, "udp_transport: sendto ipv6 failed nbytes=%zu errno=%d (%s)", nbytes, errno,
+                            std::strerror(errno));
+                    }
+                    else if (static_cast<size_t>(sn) != nbytes)
+                    {
+                        LOG(utils::WRN, "udp_transport: sendto ipv6 partial sent=%zd expected=%zu", sn, nbytes);
+                    }
                 }
                 else if constexpr (std::is_same_v<T, ignore_transport_s>)
                 {
