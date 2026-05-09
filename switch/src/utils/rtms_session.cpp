@@ -26,6 +26,17 @@ void fill_random_octets(std::uint8_t* p_out, std::size_t nbytes)
     }
 }
 
+std::uint64_t random_stream_member_id()
+{
+    std::uint64_t v{};
+    do
+    {
+        fill_random_octets(reinterpret_cast<std::uint8_t*>(&v), sizeof v);
+    }
+    while (v == static_cast<std::uint64_t>(0));
+    return v;
+}
+
 cum::session random_session_tag()
 {
     cum::session s;

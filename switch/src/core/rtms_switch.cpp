@@ -437,7 +437,7 @@ void rtms_switch::handle_message(
     cum::bytes const& challenge_blob = pending.challenge;
     bool const        verified =
         m_config.identity_store->verify_identity(challenge_blob, p_response.challenge_response,
-                                                 p_response.username);
+                                                 p_response.username, m_config.identity_allow_guest);
     if (!verified)
     {
         fail_retry(cum::reason_code::CHALLENGE_FAILURE);
@@ -485,13 +485,13 @@ void rtms_switch::handle_message(
 {
     if (!client_is_authenticated(p_rx_session))
     {
-        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
     session_data_ptr_t const sess = p_rx_session;
     if (!sess)
     {
-        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
 
@@ -542,13 +542,13 @@ void rtms_switch::handle_message(
 {
     if (!client_is_authenticated(p_rx_session))
     {
-        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
     session_data_ptr_t const sess = p_rx_session;
     if (!sess)
     {
-        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
 
@@ -627,13 +627,13 @@ void rtms_switch::handle_message(
 {
     if (!client_is_authenticated(p_rx_session))
     {
-        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
     session_data_ptr_t const sess = p_rx_session;
     if (!sess)
     {
-        (void)try_send_ignore(p_transport, p_pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
 
@@ -676,15 +676,15 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
     auto const ep = utils::transport_endpoint_key_to_string(p_transport);
     if (!client_is_authenticated(p_rx_session))
     {
-        LOG(utils::DBG, "rtms_switch::stream_data | drop not authenticated from=%s", ep.c_str());
-        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        LOG(utils::DBG, "rtms_switch::stream_data | not authenticated from=%s → identity_request", ep.c_str());
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
     session_data_ptr_t const sender = p_rx_session;
     if (!sender)
     {
-        LOG(utils::DBG, "rtms_switch::stream_data | drop session mismatch from=%s", ep.c_str());
-        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        LOG(utils::DBG, "rtms_switch::stream_data | no session from=%s → identity_request", ep.c_str());
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
 
@@ -692,8 +692,8 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
 
     if (!sender->transport_key.has_value())
     {
-        LOG(utils::DBG, "rtms_switch::stream_data | drop sender transport missing from=%s", ep.c_str());
-        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+        LOG(utils::DBG, "rtms_switch::stream_data | sender transport missing from=%s → identity_request", ep.c_str());
+        send_identity_request(p_transport, cum::reason_code::UNRECOGNIZED_TRANSPORT);
         return;
     }
 
@@ -702,7 +702,7 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
     {
         LOG(utils::DBG, "rtms_switch::stream_data | drop unknown channel_id=%" PRIu64 " from=%s",
             static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
-        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_JOINED, {});
+        (void)try_send_ignore(p_transport, pdu, cum::reason_code::UNKNOWN_CHANNEL, {});
         return;
     }
 
@@ -711,7 +711,7 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
     {
         LOG(utils::DBG, "rtms_switch::stream_data | drop null channel context channel_id=%" PRIu64 " from=%s",
             static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
-        (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_JOINED, {});
+        (void)try_send_ignore(p_transport, pdu, cum::reason_code::UNKNOWN_CHANNEL, {});
         return;
     }
 
@@ -741,6 +741,7 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
     }
 
     sd.from_username = sender->username;
+    sd.from_session = static_cast<cum::u64>(sender->stream_member_id);
 
     alignas(std::max_align_t) std::array<std::byte, cum::bytes::max_size * 4> wire{};
     size_t                                                    nbytes = 0;
@@ -790,11 +791,13 @@ void rtms_switch::on_message(transport_endpoint_key_t const& p_transport, bfc::b
     }
     catch (std::exception const&)
     {
-        LOG(utils::WRN, "rtms_switch: dropped datagram (PER decode failed) nbytes=%zu",
-            static_cast<std::size_t>(p_payload.size()));
+        std::string const hex = utils::bytes_to_hex(p_payload.data(), p_payload.size());
+        LOG(utils::WRN, "rtms_switch: dropped datagram (PER decode failed) nbytes=%zu hex=%s",
+            static_cast<std::size_t>(p_payload.size()), hex.c_str());
         return;
     }
 
+    // @note : print request response message but not stream data
     if (!std::holds_alternative<cum::stream_data>(pdu.message))
     {
         std::string pdu_json;
@@ -814,11 +817,11 @@ void rtms_switch::on_message(transport_endpoint_key_t const& p_transport, bfc::b
         if (!rx_sess)
         {
             LOG(utils::WRN,
-                "rtms_switch::on_message | drop unknown session after PER decode nbytes=%zu is_stream_data=%d "
-                "(browser/switch codec mismatch or corrupt datagram)",
+                "rtms_switch::on_message | unknown session after PER decode nbytes=%zu is_stream_data=%d "
+                "(browser/switch codec mismatch or stale session — sending identity_request)",
                 static_cast<std::size_t>(p_payload.size()),
                 std::holds_alternative<cum::stream_data>(pdu.message) ? 1 : 0);
-            (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
+            send_identity_request(p_transport, cum::reason_code::SESSION_NOT_AVAILABLE);
             return;
         }
         rebind_session_to_transport(rx_sess, p_transport);

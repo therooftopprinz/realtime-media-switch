@@ -32,6 +32,8 @@ struct rtms_switch_config_t
     identity_manager const* identity_store{nullptr};
     /** Global caps merged with per-channel `create_request.limits` (nonzero fields apply). */
     cum::channel_limits     shared_channel_limits{};
+    /** Permit usernames not present in `identity_store` using empty-password challenge. */
+    bool                    identity_allow_guest{false};
     uint32_t                ignore_indication_cooldown_ms{1000};
 };
 

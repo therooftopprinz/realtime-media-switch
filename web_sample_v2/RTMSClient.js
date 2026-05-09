@@ -7,13 +7,14 @@ import {
   encodeUsing_rtms,
   decodeUsing_rtms,
   status_code,
+  reason_code,
 } from "./js/rtms_protocol.mjs";
 
 export const PROTOCOL_VERSION = 1;
 /** Max encoded RTMS PDU bytes (matches `bytes = dynamic<u8, 32768>`). */
 export const RTMS_PDU_MAX_BYTES = 32768;
 /** Conservative envelope reserve (rtms fields around stream_data payload). */
-export const RTMS_ENVELOPE_OVERHEAD_BYTES = 44;
+export const RTMS_ENVELOPE_OVERHEAD_BYTES = 52;
 /** Max stream_data payload bytes we can safely place in one PDU. */
 export const RTMS_MAX_SDU_BYTES = RTMS_PDU_MAX_BYTES - RTMS_ENVELOPE_OVERHEAD_BYTES;
 
@@ -41,7 +42,8 @@ export async function hmacSha256PasswordKey(passwordUtf8, challengeU8) {
 
 /**
  * One joined channel. Handlers receive decoded `stream_data` bodies from rtms_protocol:
- * `{ stream_data: { from_username, channel_id, payload } }` — see dispatch shape.
+ * `{ stream_data: { from_username, from_session, channel_id, payload } }`
+ * (`from_session`: u64 `bigint`, server-assigned random id per login — not the RTMS secret session).
  */
 export class Channel {
   /**
@@ -59,7 +61,7 @@ export class Channel {
   }
 
   /**
-   * @param {(stream_data: { from_username: string, channel_id: bigint, payload: Uint8Array }) => void} fn
+   * @param {(stream_data: { from_username: string, from_session: bigint, channel_id: bigint, payload: Uint8Array }) => void} fn
    * @returns {() => void} unregister
    */
   registerHandler(fn) {
@@ -68,7 +70,7 @@ export class Channel {
   }
 
   /**
-   * @param {{ from_username: string, channel_id: bigint, payload: Uint8Array }} streamDataMsg
+   * @param {{ from_username: string, from_session: bigint, channel_id: bigint, payload: Uint8Array }} streamDataMsg
    */
   _notify(streamDataMsg) {
     for (const h of this._handlers) {
@@ -124,8 +126,18 @@ export class RTMSClient {
 
     /** @type {(() => void) | null} */
     this.onOpen = null;
+    /** @type {(() => void) | null} Called once per connection after a successful identity_response handshake. */
+    this.onAuthenticated = null;
+    /**
+     * Wrong password / mismatch (server `identity_request` with `reason` CHALLENGE_FAILURE).
+     * @type {((detail: { reason: number }) => void | Promise<void>) | null}
+     */
+    this.onIdentityFailed = null;
     /** @type {(() => void) | null} */
     this.onClose = null;
+
+    /** Emit {@link RTMSClient.onAuthenticated} only once until teardown. */
+    this._authenticatedEmitted = false;
 
     /** @type {number | null} */
     this._lastHbSent = null;
@@ -197,6 +209,7 @@ export class RTMSClient {
     this.sendPdu({
       stream_data: {
         from_username: "",
+        from_session: 0n,
         channel_id: channelId,
         payload: sdu instanceof Uint8Array ? sdu : new Uint8Array(sdu),
       },
@@ -268,6 +281,7 @@ export class RTMSClient {
     this._pending.clear();
     this._channels.clear();
     this._sessionBlob = null;
+    this._authenticatedEmitted = false;
   }
 
   _startHeartbeat() {
@@ -384,16 +398,32 @@ export class RTMSClient {
       // identity_request, not a heartbeat echo. Drop the stale send timestamp so we
       // never pair a later echo with that pre-auth ping.
       this._lastHbSent = null;
+
+      const r = Number(body.reason ?? 0);
+      if (r === Number(reason_code.CHALLENGE_FAILURE)) {
+        (async () => {
+          try {
+            await Promise.resolve(this.onIdentityFailed?.({ reason: r }));
+          } finally {
+            this.disconnect();
+          }
+        })();
+        this.onGlobalMessage?.({ tag, pdu });
+        return;
+      }
+
       (async () => {
         const user = this._username;
         const pass = this._password;
-        if (!user || !pass) {
-          console.warn("identity_request but missing username/password");
+        if (!user) {
+          console.warn("identity_request but missing username");
           return;
         }
         const challenge = new Uint8Array(body.challenge_request);
         const use = Uint8Array.from(body.new_session);
-        const sig = await hmacSha256PasswordKey(pass, challenge);
+        // Web Crypto rejects empty raw HMAC keys; guest login uses placeholder "password".
+        const hmacKey = pass.length > 0 ? pass : "password";
+        const sig = await hmacSha256PasswordKey(hmacKey, challenge);
         this.sendPdu({
           identity_response: {
             req_id: body.req_id,
@@ -406,7 +436,16 @@ export class RTMSClient {
         // Heartbeat is only echoed once authenticated; prime RTT immediately after login.
         this.sendPdu({ heartbeat: {} });
         this._lastHbSent = performance.now();
+        if (!this._authenticatedEmitted) {
+          this._authenticatedEmitted = true;
+          this.onAuthenticated?.();
+        }
       })();
+      this.onGlobalMessage?.({ tag, pdu });
+      return;
+    }
+
+    if (tag === "ignored_indication") {
       this.onGlobalMessage?.({ tag, pdu });
       return;
     }
@@ -466,8 +505,14 @@ export class RTMSClient {
       const cid = BigInt(body.channel_id);
       const ch = this._channels.get(cid.toString());
       const payload = Uint8Array.from(body.payload ?? []);
+      const rawFs = body.from_session;
+      const from_session =
+        typeof rawFs === "bigint"
+          ? rawFs
+          : BigInt.asUintN(64, BigInt(Number(rawFs ?? 0)));
       const streamDataMsg = {
         from_username: String(body.from_username ?? ""),
+        from_session,
         channel_id: cid,
         payload,
       };

@@ -62,7 +62,7 @@ std::size_t identity_manager::user_count() const
 }
 
 bool identity_manager::verify_identity(cum::bytes const& p_challenge, cum::bytes const& p_answer,
-                                       std::string const& p_username) const
+                                       std::string const& p_username, bool p_allow_guest) const
 {
     if (p_answer.size() != utils::hmac_sha256_digest_bytes || p_challenge.size() == 0)
     {
@@ -70,15 +70,25 @@ bool identity_manager::verify_identity(cum::bytes const& p_challenge, cum::bytes
     }
 
     auto it = m_password_by_username.find(p_username);
-    if (it == m_password_by_username.end())
+    // Guest usernames match HMAC keyed with this literal (browser cannot use an empty HMAC key).
+    static std::string const guest_hmac_password{"password"};
+    std::string const* password = nullptr;
+    if (it != m_password_by_username.end())
+    {
+        password = &it->second;
+    }
+    else if (!p_allow_guest)
     {
         return false;
     }
+    else
+    {
+        password = &guest_hmac_password;
+    }
 
-    std::string const& password = it->second;
     std::uint8_t computed[utils::hmac_sha256_digest_bytes]{};
 
-    utils::hmac_sha256(reinterpret_cast<std::uint8_t const*>(password.data()), password.size(), p_challenge.data(),
+    utils::hmac_sha256(reinterpret_cast<std::uint8_t const*>(password->data()), password->size(), p_challenge.data(),
                        p_challenge.size(), computed);
 
     return utils::hmac_sha256_digest_equals(computed, p_answer.data(), utils::hmac_sha256_digest_bytes);

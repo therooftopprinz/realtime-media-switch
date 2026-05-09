@@ -929,6 +929,18 @@ function setStatus(s) {
   $("statusLine").textContent = s;
 }
 
+function isGuestMode() {
+  return Boolean($("allowGuest")?.checked);
+}
+
+function syncGuestUi() {
+  const guest = isGuestMode();
+  const wrap = $("passwordFieldWrap");
+  if (wrap) wrap.hidden = guest;
+  const pass = $("password");
+  if (pass && guest) pass.value = "";
+}
+
 function syncAddSourceOptions() {
   const metaKey =
     /** @type {keyof META_SOURCE_OPTIONS} */ ($("chMeta").value || "chat");
@@ -1075,12 +1087,15 @@ function applySelectedSavedUser() {
   if (!rec) return;
   $("username").value = rec.username;
   $("password").value = rec.password;
+  if (isGuestMode()) {
+    $("password").value = "";
+  }
 }
 
 function saveCurrentCredentials() {
   const username = $("username").value.trim();
-  const password = $("password").value;
-  if (!username || !password) return;
+  const password = isGuestMode() ? "" : $("password").value;
+  if (!username) return;
   const users = readSavedUsers();
   const existing = users.find((u) => u.username === username);
   if (existing) {
@@ -1125,6 +1140,7 @@ function broadcastStreamChunk(channelIdBig, u8, opts = {}) {
     sendPdu({
       stream_data: {
         from_username: uname,
+        from_session: 0,
         channel_id: cid,
         payload: Array.from(slice),
       },
@@ -1204,6 +1220,7 @@ function broadcastVideoFrameDatagram(channelIdBig, frameBytes, isKey, maxChunkSi
     sendPdu({
       stream_data: {
         from_username: uname,
+        from_session: 0,
         channel_id: cid,
         payload: Array.from(out),
       },
@@ -1666,7 +1683,7 @@ function dispatchIncoming(data) {
   if (tag === "heartbeat") {
     const u = $("username").value.trim();
     const p = $("password").value;
-    if ((!u || !p) && !identityComplete) {
+    if ((!u || (!p && !isGuestMode())) && !identityComplete) {
       identityComplete = true;
       $("btnAdd").disabled = false;
       setStatus("Connected (anonymous).");
@@ -1676,10 +1693,10 @@ function dispatchIncoming(data) {
 
   if (tag === "identity_request") {
     (async () => {
-      const pass = $("password").value;
+      const pass = isGuestMode() ? "password" : $("password").value;
       const user = $("username").value.trim();
-      if (!user || !pass) {
-        setStatus("Server requested identity: set username and password, then reconnect.");
+      if (!user || (!pass && !isGuestMode())) {
+        setStatus("Server requested identity: set username and password (or guest mode), then reconnect.");
         return;
       }
       const challenge = new Uint8Array(body.challenge_request);
@@ -1891,6 +1908,15 @@ function getInjectedBaseUrl() {
 
 function connect() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
+  syncGuestUi();
+  if (!$("username").value.trim()) {
+    setStatus("Username required.");
+    return;
+  }
+  if (!isGuestMode() && !$("password").value) {
+    setStatus("Password required (or enable guest mode).");
+    return;
+  }
   saveCurrentCredentials();
   teardownConnection();
   const base = getInjectedBaseUrl();
@@ -1920,6 +1946,7 @@ function connect() {
 $("btnConnect").onclick = connect;
 $("btnDisconnect").onclick = () => ws?.close();
 $("savedUsers").onchange = () => applySelectedSavedUser();
+$("allowGuest").onchange = () => syncGuestUi();
 $("btnDeleteSaved").onclick = () => deleteSelectedSavedUser();
 $("btnClearSaved").onclick = () => clearSavedUsers();
 $("btnAdd").onclick = () => {
@@ -1932,3 +1959,4 @@ $("btnAddOk").onclick = () => submitAddChannel();
 $("chMeta").onchange = () => syncAddSourceOptions();
 syncAddSourceOptions();
 renderSavedUsers();
+syncGuestUi();

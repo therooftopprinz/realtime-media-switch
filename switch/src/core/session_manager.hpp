@@ -48,6 +48,8 @@ struct session_data_s
     std::string                             username;
     std::optional<transport_endpoint_key_t> transport_key;
     session_id_t                            session_id{};
+    /** Anonymous / pre-auth stays 0; set once when username is assigned (distinct per logical login/session). */
+    std::uint64_t                           stream_member_id{};
 };
 
 using session_data_ptr_t = std::shared_ptr<session_data_s>;

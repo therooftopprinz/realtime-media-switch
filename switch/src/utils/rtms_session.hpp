@@ -13,6 +13,9 @@ namespace utils
 
 void fill_random_octets(std::uint8_t* p_out, std::size_t nbytes);
 
+/** Non-zero cryptorandom identifier (wire `stream_data.from_session`; not the secret RTMS session tag). */
+[[nodiscard]] std::uint64_t random_stream_member_id();
+
 [[nodiscard]] cum::session random_session_tag();
 
 [[nodiscard]] bool session_bytes_equal(cum::session const& p_expected, cum::bytes const& p_got);

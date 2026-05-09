@@ -175,6 +175,21 @@
     dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
     .dialog-buttons { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
     code.stats { font-size: 11px; display: block; white-space: pre-wrap; color: #333; margin-top: 8px; }
+    label.guest-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      white-space: nowrap;
+      cursor: pointer;
+      align-self: flex-end;
+      margin-bottom: 2px;
+    }
+    label.guest-check input { margin: 0; }
+    /* Author `.field { display: flex }` beats UA `[hidden]`; force hide when guest. */
+    #passwordFieldWrap[hidden] {
+      display: none !important;
+    }
   </style>
 </head>
 <body>
@@ -189,10 +204,11 @@
       <label class="small" for="username">Username</label>
       <input id="username" type="text" autocomplete="username" />
     </div>
-    <div class="field grow">
+    <div id="passwordFieldWrap" class="field grow">
       <label class="small" for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" />
     </div>
+    <label class="guest-check" for="allowGuest"><input id="allowGuest" type="checkbox" /> Login as guest</label>
     <button type="button" class="secondary" id="btnDeleteSaved">Delete Saved</button>
     <button type="button" class="danger" id="btnClearSaved">Clear Saved</button>
     <button type="button" id="btnConnect">Connect</button>

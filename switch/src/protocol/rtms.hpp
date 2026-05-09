@@ -12,7 +12,7 @@ namespace cum
 /
 ************************************************/
 
-using bytes = cum::vector<u8, 32768>;
+using bytes = cum::vector<u8, 2048>;
 using session = cum::array<u8, 16>;
 using optional_session = std::optional<session>;
 enum status_code
@@ -30,7 +30,8 @@ enum reason_code
     SESSION_NOT_AVAILABLE,
     EXPIRATION_REFRESH,
     NOT_JOINED,
-    NOT_AUTHENTICATED
+    NOT_AUTHENTICATED,
+    UNKNOWN_CHANNEL
 };
 
 struct heartbeat
@@ -110,6 +111,7 @@ struct leave_response
 struct stream_data
 {
     string from_username;
+    u64 from_session;
     u64 channel_id;
     bytes payload;
 };
@@ -173,6 +175,7 @@ inline void str(const char* pName, const reason_code& pIe, std::string& pCtx, bo
     if (reason_code::EXPIRATION_REFRESH == pIe) pCtx += "\"EXPIRATION_REFRESH\"";
     if (reason_code::NOT_JOINED == pIe) pCtx += "\"NOT_JOINED\"";
     if (reason_code::NOT_AUTHENTICATED == pIe) pCtx += "\"NOT_AUTHENTICATED\"";
+    if (reason_code::UNKNOWN_CHANNEL == pIe) pCtx += "\"UNKNOWN_CHANNEL\"";
     pCtx = pCtx + "}";
     if (!pIsLast)
     {
@@ -602,6 +605,7 @@ inline void encode_per(const stream_data& pIe, cum::per_codec_ctx& pCtx)
 {
     using namespace cum;
     encode_per(pIe.from_username, pCtx);
+    encode_per(pIe.from_session, pCtx);
     encode_per(pIe.channel_id, pCtx);
     encode_per(pIe.payload, pCtx);
 }
@@ -610,6 +614,7 @@ inline void decode_per(stream_data& pIe, cum::per_codec_ctx& pCtx)
 {
     using namespace cum;
     decode_per(pIe.from_username, pCtx);
+    decode_per(pIe.from_session, pCtx);
     decode_per(pIe.channel_id, pCtx);
     decode_per(pIe.payload, pCtx);
 }
@@ -626,8 +631,9 @@ inline void str(const char* pName, const stream_data& pIe, std::string& pCtx, bo
         pCtx = pCtx + "\"" + pName + "\":{";
     }
     size_t nOptional = 0;
-    size_t nMandatory = 3;
+    size_t nMandatory = 4;
     str("from_username", pIe.from_username, pCtx, !(--nMandatory+nOptional));
+    str("from_session", pIe.from_session, pCtx, !(--nMandatory+nOptional));
     str("channel_id", pIe.channel_id, pCtx, !(--nMandatory+nOptional));
     str("payload", pIe.payload, pCtx, !(--nMandatory+nOptional));
     pCtx = pCtx + "}";

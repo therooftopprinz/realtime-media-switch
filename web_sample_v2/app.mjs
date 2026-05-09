@@ -103,6 +103,9 @@ let colCount = 2;
 /** @type {string | null} */
 let maxedKey = null;
 
+/** Avoid duplicate disconnect toasts when the app already surfaced the reason (`btnDisc`, identity failure). */
+let suppressDisconnectToast = false;
+
 let selfName = "";
 
 /** @type {MediaStream | null} */
@@ -249,6 +252,18 @@ function getBase() {
   return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 }
 
+function isGuestMode() {
+  return Boolean($("allowGuest")?.checked);
+}
+
+function syncGuestUi() {
+  const guest = isGuestMode();
+  const wrap = $("passwordFieldWrap");
+  if (wrap) wrap.hidden = guest;
+  const pass = $("password");
+  if (pass && guest) pass.value = "";
+}
+
 function makeWireName(short) {
   return `rtmsdemo|${short}`;
 }
@@ -265,9 +280,54 @@ function makeSdu(t, body) {
   return out;
 }
 
-function markActivePeer(name) {
-  if (!name || name === selfName) return;
-  activePeers.set(name, Date.now());
+/** Tail segment after first `::` in `cid::tail` composite keys. */
+function peerKeyTail(peerKey) {
+  const i = peerKey.indexOf("::");
+  return i < 0 ? "" : peerKey.slice(i + 2);
+}
+
+/**
+ * Normalized wire `stream_data.from_session` (u64 random per logical login — not RTMS PDU session).
+ * @param {unknown} v
+ */
+function streamMemberIdBi(v) {
+  if (typeof v === "bigint") return BigInt.asUintN(64, v);
+  const n = Number(v);
+  if (Number.isFinite(n)) return BigInt.asUintN(64, BigInt(n));
+  return 0n;
+}
+
+/**
+ * @param {{ from_username?: string, from_session?: bigint | number }} sd
+ */
+function transportPeerTail(sd) {
+  const bi = streamMemberIdBi(sd?.from_session ?? 0n);
+  if (bi !== 0n)
+    return `u:${bi.toString(16).padStart(16, "0")}`;
+  const u = String(sd.from_username ?? "").trim() || "anon";
+  return `legacy:${u}`;
+}
+
+/**
+ * @param {string} cidStr
+ * @param {{ from_username?: string, from_session?: bigint | number }} sd
+ */
+function transportPeerKey(cidStr, sd) {
+  return `${cidStr}::${transportPeerTail(sd)}`;
+}
+
+/** @param {string} peerKey */
+function captionOptsFromPeerKey(peerKey) {
+  if (peerKeyTail(peerKey) === LOCAL_VIDEO_PEER) return { isLocalLoopback: true };
+  return {};
+}
+
+/** @param {string} peerKey */
+function markActiveRemotePeer(peerKey) {
+  const tail = peerKeyTail(peerKey);
+  if (!tail || tail === LOCAL_VIDEO_PEER || tail.startsWith("legacy:")) return;
+  if (!tail.startsWith("u:")) return;
+  activePeers.set(tail.slice(2), Date.now());
 }
 
 function wireChannelName(short) {
@@ -325,12 +385,15 @@ function applySelectedSavedUser() {
   if (!rec) return;
   $("username").value = rec.username;
   $("password").value = rec.password;
+  if (isGuestMode()) {
+    $("password").value = "";
+  }
 }
 
 function saveCurrentCredentials() {
   const username = $("username").value.trim();
-  const password = $("password").value;
-  if (!username || !password) return;
+  const password = isGuestMode() ? "" : $("password").value;
+  if (!username) return;
   const users = readSavedUsers();
   const existing = users.find((u) => u.username === username);
   if (existing) {
@@ -782,7 +845,7 @@ function syncLocalVideoLoopback() {
   }
 
   if (!findTileByPeerKey(peerKey)) {
-    const { panel } = createTile(peerKey, selfName);
+    const { panel } = createTile(peerKey, selfName, { isLocalLoopback: true });
     $("tileGrid").append(panel);
     applyMaxLayout();
   }
@@ -838,11 +901,10 @@ function parseVideoDatagramHeader(u8) {
  * @param {LocalChannel} rec
  * @param {string} fromUser
  * @param {ReturnType<typeof parseVideoDatagramHeader>} dgram
+ * @param {string} peerKey
  */
-function ingestLegacyRtv1Fragment(rec, fromUser, dgram) {
-  const cidStr = rec.channel.channelId.toString();
+function ingestLegacyRtv1Fragment(rec, fromUser, dgram, peerKey) {
   const label = (fromUser && String(fromUser).trim()) || "anon";
-  const peerKey = `${cidStr}::${label}`;
   const rk = `${peerKey}::${dgram.frameId}`;
   let rrec = legacyVideoFragRx.get(rk);
   if (!rrec || rrec.total !== dgram.fragCount) {
@@ -872,7 +934,7 @@ function ingestLegacyRtv1Fragment(rec, fromUser, dgram) {
     _dbgRtvAssembleN = 0;
     _dbgRtvAssembleSummaryT = now;
   }
-  feedPeerH264AnnexB(rec, label, assembled);
+  feedPeerH264AnnexB(rec, label, assembled, peerKey);
 }
 
 /**
@@ -901,8 +963,9 @@ function buildH264V2FragBody(seq, idx, count, chunk) {
  * @param {LocalChannel} rec
  * @param {string} fromUser
  * @param {Uint8Array} body
+ * @param {string} peerKey
  */
-function ingestV2H264Fragment(rec, fromUser, body) {
+function ingestV2H264Fragment(rec, fromUser, body, peerKey) {
   if (body.length < H264_V2_FRAG_HDR_BYTES) return;
   if (body[0] !== H264_V2_FRAG_MAGIC) return;
   const seq =
@@ -911,9 +974,7 @@ function ingestV2H264Fragment(rec, fromUser, body) {
   const fragCount = (body[7] << 8) | body[8];
   const chunk = body.subarray(H264_V2_FRAG_HDR_BYTES);
   if (fragCount < 1 || fragIndex >= fragCount || !chunk.length) return;
-  const cidStr = rec.channel.channelId.toString();
   const label = (fromUser && String(fromUser).trim()) || "anon";
-  const peerKey = `${cidStr}::${label}`;
   const rk = `${peerKey}::${seq}`;
   let rrec = v2H264FragRx.get(rk);
   if (!rrec || rrec.total !== fragCount) {
@@ -930,7 +991,7 @@ function ingestV2H264Fragment(rec, fromUser, body) {
   }
   v2H264FragRx.delete(rk);
   const assembled = concatU8(ordered);
-  feedPeerH264AnnexB(rec, label, assembled);
+  feedPeerH264AnnexB(rec, label, assembled, peerKey);
 }
 
 /**
@@ -938,16 +999,15 @@ function ingestV2H264Fragment(rec, fromUser, body) {
  * @param {LocalChannel} rec
  * @param {string} user
  * @param {Uint8Array} annexB
+ * @param {string} peerKey
  */
-function feedPeerH264AnnexB(rec, user, annexB) {
-  const cidStr = rec.channel.channelId.toString();
-  const peerKey = `${cidStr}::${user || "anon"}`;
+function feedPeerH264AnnexB(rec, user, annexB, peerKey) {
   const hadRenderer = videoLRU.has(peerKey);
   let slot = document.querySelector(`[data-peer="${peerKey}"]`);
   let canvas = slot?.querySelector("canvas");
   if (!slot) {
     vlog("feedPeerH264AnnexB: new tile", { peerKey, user: user || "anon", bytes: annexB.length });
-    const { panel, cv } = createTile(peerKey, user || "?");
+    const { panel, cv } = createTile(peerKey, user || "?", {});
     slot = panel;
     canvas = cv;
     $("tileGrid").append(panel);
@@ -984,17 +1044,18 @@ function renderMuteList() {
 
 /**
  * @param {LocalChannel} rec
- * @param {{ from_username: string, channel_id: bigint, payload: Uint8Array }} sd
+ * @param {{ from_username: string, from_session: bigint, channel_id: bigint, payload: Uint8Array }} sd
  */
 function onStreamSdu(rec, sd) {
   const pl = sd.payload;
   if (!pl.length) return;
-  const user = String(sd.from_username || "");
-  markActivePeer(user);
+  const user = String(sd.from_username || "").trim() || "?";
+  const cidStr = rec.channel.channelId.toString();
+  const peerKey = transportPeerKey(cidStr, sd);
+  markActiveRemotePeer(peerKey);
 
   const typ = pl[0];
   const body = pl.subarray(1);
-  const cidStr = rec.channel.channelId.toString();
 
   if (typ === PAYLOAD.CHAT) {
     if (rec.id !== focusedId) return;
@@ -1027,7 +1088,7 @@ function onStreamSdu(rec, sd) {
       }
       return;
     }
-    ingestLegacyRtv1Fragment(rec, user, rtv1);
+    ingestLegacyRtv1Fragment(rec, user, rtv1, peerKey);
     return;
   }
 
@@ -1044,11 +1105,10 @@ function onStreamSdu(rec, sd) {
       }
       return;
     }
-    const peerKey = `${cidStr}::${user || "anon"}`;
     let slot = document.querySelector(`[data-peer="${peerKey}"]`);
     let canvas = slot?.querySelector("canvas");
     if (!slot) {
-      const { panel, cv, cap } = createTile(peerKey, user || "?");
+      const { panel, cv } = createTile(peerKey, user || "?", {});
       slot = panel;
       canvas = cv;
       $("tileGrid").append(panel);
@@ -1099,7 +1159,7 @@ function onStreamSdu(rec, sd) {
       return;
     }
     if (body.length && body[0] === H264_V2_FRAG_MAGIC) {
-      ingestV2H264Fragment(rec, user, body);
+      ingestV2H264Fragment(rec, user, body, peerKey);
       return;
     }
     _dbgV2RxH264SummaryN++;
@@ -1117,7 +1177,7 @@ function onStreamSdu(rec, sd) {
         _dbgV2RxH264SummaryT = t;
       }
     }
-    feedPeerH264AnnexB(rec, user || "anon", body);
+    feedPeerH264AnnexB(rec, user || "anon", body, peerKey);
     return;
   }
 
@@ -1127,7 +1187,7 @@ function onStreamSdu(rec, sd) {
   }
 
   if (typ === PAYLOAD.OPUS) {
-    const akey = `${cidStr}::${user || "anon"}`;
+    const akey = peerKey;
     const seq = audioSeq.get(akey) ?? 0;
     audioSeq.set(akey, seq + 1);
     const ts = seq * OPUS_FRAME_DURATION_US;
@@ -1153,14 +1213,22 @@ function onStreamSdu(rec, sd) {
   }
 }
 
-function createTile(peerKey, label) {
+/**
+ * @param {string} peerKey
+ * @param {string} label
+ * @param {{ isLocalLoopback?: boolean }} [capOpts]
+ */
+function createTile(peerKey, label, capOpts = {}) {
   const panel = document.createElement("div");
   panel.className = "tile";
   panel.dataset.peer = peerKey;
+  panel.dataset.displayName = label;
+  const merged = { ...captionOptsFromPeerKey(peerKey), ...capOpts };
+  if (merged.isLocalLoopback) panel.dataset.localLoopback = "1";
   const canvas = document.createElement("canvas");
   const cap = document.createElement("div");
   cap.className = "tile-caption";
-  cap.textContent = formatTileCaption(label);
+  cap.textContent = formatTileCaption(label, merged);
   panel.append(canvas, cap);
   panel.onclick = () => {
     maxedKey = maxedKey === peerKey ? null : peerKey;
@@ -1320,34 +1388,26 @@ function wantSendAudio() {
   return $("togSendAudio").classList.contains("on");
 }
 
-/** @param {string} username stream_data from_username */
-function isSelfStreamUsername(username) {
-  const a = String(username || "").trim();
-  const b = String(selfName || "").trim();
-  if (!a || !b) return false;
-  return a === b || a.toLowerCase() === b.toLowerCase();
-}
-
-/** @param {string} username */
-function formatTileCaption(username) {
-  const u = String(username || "?");
-  if (isSelfStreamUsername(u) && wantSendVideo()) return `${u} (you)`;
+/**
+ * @param {string} label
+ * @param {{ isLocalLoopback?: boolean }} [opts]
+ */
+function formatTileCaption(label, opts = {}) {
+  const u = String(label || "?");
+  if (!wantSendVideo()) return u;
+  if (opts.isLocalLoopback) return `${u} (you)`;
   return u;
-}
-
-/** @param {string} peerKey */
-function peerKeyUsername(peerKey) {
-  const i = peerKey.lastIndexOf("::");
-  const tail = i < 0 ? peerKey : peerKey.slice(i + 2);
-  if (tail === LOCAL_VIDEO_PEER) return selfName || "?";
-  return tail;
 }
 
 function refreshAllTileCaptions() {
   for (const el of document.querySelectorAll(".tile[data-peer]")) {
     const cap = el.querySelector(".tile-caption");
     if (!cap) continue;
-    cap.textContent = formatTileCaption(peerKeyUsername(el.dataset.peer || ""));
+    const displayName = el.dataset.displayName || "?";
+    /** @type {{ isLocalLoopback?: boolean }} */
+    const o = {};
+    if (el.dataset.localLoopback === "1") o.isLocalLoopback = true;
+    cap.textContent = formatTileCaption(displayName, o);
   }
 }
 
@@ -1802,14 +1862,20 @@ function setCols(n) {
 function bindUi() {
   renderSavedUsers();
   renderSavedChannelsList();
+  syncGuestUi();
   $("savedUsers").onchange = () => applySelectedSavedUser();
   $("btnDeleteSaved").onclick = () => deleteSelectedSavedUser();
+  $("allowGuest").onchange = () => syncGuestUi();
 
   $("btnLogin").onclick = async () => {
     const u = $("username").value.trim();
-    const p = $("password").value;
-    if (!u || !p) {
-      toast("Username and password required");
+    const p = isGuestMode() ? "" : $("password").value;
+    if (!u) {
+      toast("Username required");
+      return;
+    }
+    if (!isGuestMode() && !p) {
+      toast("Password required (or enable guest mode)");
       return;
     }
     saveCurrentCredentials();
@@ -1817,6 +1883,9 @@ function bindUi() {
     const wsUrl = new URL(`${getBase()}/ws`, window.location.origin);
     wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
     client.onOpen = () => {
+      // Stay on login until RTMS identity succeeds (`onAuthenticated`).
+    };
+    client.onAuthenticated = () => {
       $("loginPanel").style.display = "none";
       $("mainPanel").classList.add("visible");
       $("stUser").textContent = selfName || "—";
@@ -1825,10 +1894,35 @@ function bindUi() {
         requestAnimationFrame(() => applyRpWidth(rpWidthPx));
       });
     };
-    client.onClose = () => {
-      toast("Disconnected");
+    client.onIdentityFailed = async () => {
+      suppressDisconnectToast = true;
+      await stopCapture();
+      for (const id of [...locals.keys()]) await leaveChannel(id);
+      clearVideoDecoders();
+      for (const o of opusDec.values()) {
+        try {
+          o.dec.close();
+        } catch (_) {}
+      }
+      opusDec.clear();
+      opusEnsuring.clear();
       $("mainPanel").classList.remove("visible");
       $("loginPanel").style.display = "";
+      focusedId = null;
+      $("channelTabs").replaceChildren();
+      $("chat").replaceChildren();
+      $("stR").textContent = "0";
+      renderMuteList();
+      toast("Login failed — check username and password");
+    };
+    client.onClose = () => {
+      $("mainPanel").classList.remove("visible");
+      $("loginPanel").style.display = "";
+      if (suppressDisconnectToast) {
+        suppressDisconnectToast = false;
+        return;
+      }
+      toast("Disconnected");
     };
     client.connect(wsUrl.toString(), { username: u, password: p });
   };
@@ -1891,6 +1985,7 @@ function bindUi() {
   $("btnDisc").onclick = async () => {
     await stopCapture();
     for (const id of [...locals.keys()]) await leaveChannel(id);
+    suppressDisconnectToast = true;
     client.disconnect();
     clearVideoDecoders();
     for (const o of opusDec.values()) {

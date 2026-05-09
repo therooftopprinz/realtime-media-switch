@@ -136,6 +136,7 @@ core::rtms_switch_config_t make_rtms_switch_config(bfc::configuration_parser con
 
     c.identity_challenge_random_bytes = cfg_u32(cfg, "identity.challenge.bytes").value_or(32);
     c.identity_store                  = core::g_identity_manager.get();
+    c.identity_allow_guest            = cfg_u32(cfg, "identity.allow_guest").value_or(0) != 0;
 
     cum::channel_limits shared{};
     if (auto v = cfg_u32(cfg, "channel.shared_limits.pkt_rate_limit"))

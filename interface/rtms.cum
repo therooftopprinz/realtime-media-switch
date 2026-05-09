@@ -1,4 +1,4 @@
-using bytes            = dynamic<u8, 32768>;
+using bytes            = dynamic<u8, 2048>;
 using session          = static<u8, 16>;
 using optional_session = optional<session>;
 
@@ -17,7 +17,8 @@ enumeration reason_code
     SESSION_NOT_AVAILABLE,  // identity_request
     EXPIRATION_REFRESH,     // identity_request
     NOT_JOINED,             // ignored_indication
-    NOT_AUTHENTICATED       // ignored_indication
+    NOT_AUTHENTICATED,      // reserved (legacy ordinal; switch uses identity_request instead)
+    UNKNOWN_CHANNEL         // ignored_indication (e.g. stream_data to missing channel_id)
 };
 
 sequence heartbeat
@@ -97,6 +98,7 @@ sequence leave_response
 sequence stream_data
 {
     string from_username;
+    u64    from_session;
     u64    channel_id;
     bytes  payload;
 };

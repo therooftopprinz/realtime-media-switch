@@ -20,7 +20,7 @@ public:
     [[nodiscard]] std::size_t user_count() const;
 
     [[nodiscard]] bool verify_identity(cum::bytes const& p_challenge, cum::bytes const& p_answer,
-                                     std::string const& p_username) const;
+                                       std::string const& p_username, bool p_allow_guest) const;
 
 private:
     std::unordered_map<std::string, std::string> m_password_by_username;

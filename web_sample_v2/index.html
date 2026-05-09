@@ -19,18 +19,31 @@
       flex-direction: column;
     }
     a { color: #7aa2ff; }
-    .toast {
+    #toastRoot {
       position: fixed;
-      bottom: 16px;
-      right: 16px;
-      max-width: 360px;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      pointer-events: none;
+      width: min(360px, calc(100vw - 32px));
+      box-sizing: border-box;
+    }
+    .toast {
+      width: 100%;
+      margin: 0;
       padding: 10px 14px;
       background: #1c2430;
       border: 1px solid #30363d;
       border-radius: 8px;
       font-size: 13px;
-      z-index: 9999;
+      text-align: center;
       box-shadow: 0 4px 24px rgba(0,0,0,.4);
+      pointer-events: auto;
     }
     #loginPanel {
       flex: 1;
@@ -371,6 +384,20 @@
       color: #d8eee0;
     }
     button.stream-tog.on .tog-hint { color: #8ddb9a; }
+    label.guest-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      color: #e6edf3;
+      cursor: pointer;
+      margin-bottom: 12px;
+      user-select: none;
+    }
+    label.guest-check input { margin: 0; }
+    #passwordFieldWrap[hidden] {
+      display: none !important;
+    }
   </style>
 </head>
 <body>
@@ -383,10 +410,11 @@
       <label class="small" for="username">Username</label>
       <input id="username" type="text" autocomplete="username" />
     </div>
-    <div class="field">
+    <div id="passwordFieldWrap" class="field">
       <label class="small" for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" />
     </div>
+    <label class="guest-check" for="allowGuest"><input id="allowGuest" type="checkbox" /> Login as guest</label>
     <div class="field">
       <label class="small" for="savedUsers">Saved logins</label>
       <select id="savedUsers">
@@ -395,7 +423,6 @@
     </div>
     <button type="button" class="secondary" id="btnDeleteSaved" style="margin-bottom:8px;">Delete Saved</button>
     <button type="button" id="btnLogin">Connect</button>
-    <p class="small" style="color:#8b949e;font-size:12px;margin-top:12px;">Uses RTMS identity over WebSocket (no cookies).</p>
     </div>
   </div>
 

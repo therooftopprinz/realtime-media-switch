@@ -30,6 +30,10 @@ session_data_ptr_t session_manager::create_session(session_id_t const& p_session
     data->transport_key = p_transport_key;
     data->username      = p_username;
     data->session_id    = utils::clone_session_id(p_session_id);
+    if (!p_username.empty())
+    {
+        data->stream_member_id = utils::random_stream_member_id();
+    }
     /** emplace clones the session id so we never copy/move `cum::session` keys in the map API. */
     m_sessions.emplace(utils::clone_session_id(p_session_id), data);
     return data;

@@ -212,6 +212,7 @@ class RtmsProducer:
                 {
                     "stream_data": {
                         "from_username": "",
+                        "from_session": 0,
                         "channel_id": self.channel_id,
                         "payload": list(piece),
                     }

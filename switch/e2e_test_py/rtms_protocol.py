@@ -11,7 +11,7 @@ from cum.cum import CodecError, PerCodecCtx, check_optional, set_optional, read_
 u8 = u16 = u32 = u64 = int
 
 bytes = list[u8]  # CUM using bytes
-# CUM dynamic sequence: at most 32768 elements.
+# CUM dynamic sequence: at most 2048 elements.
 
 session = list[u8]  # fixed len '16'  # CUM using session
 # CUM static array: fixed length '16' (not emitted separately in Python).
@@ -32,6 +32,7 @@ class reason_code(IntEnum):
     EXPIRATION_REFRESH = 3
     NOT_JOINED = 4
     NOT_AUTHENTICATED = 5
+    UNKNOWN_CHANNEL = 6
 
 class heartbeat(TypedDict):
     pass  # CUM empty sequence
@@ -90,6 +91,7 @@ class leave_response(TypedDict):
 
 class stream_data(TypedDict):
     from_username: str
+    from_session: u64
     channel_id: u64
     payload: list[u8]
 
@@ -217,13 +219,13 @@ def decode_using_string(ctx: PerCodecCtx) -> str:
     return ctx.decode_c_string_latin1()
 
 def encode_using_bytes(obj, ctx: PerCodecCtx) -> None:
-    if len(obj) > 32768: raise CodecError('bytes')
-    ctx.write_count(32768, len(obj))
+    if len(obj) > 2048: raise CodecError('bytes')
+    ctx.write_count(2048, len(obj))
     for it in obj:
         encode_using_u8(it, ctx)
 
 def decode_using_bytes(ctx: PerCodecCtx):
-    n = ctx.read_count(32768)
+    n = ctx.read_count(2048)
     arr = []
     for _ in range(n):
         arr.append(decode_using_u8(ctx))
@@ -399,12 +401,14 @@ def decode_using_leave_response(ctx: PerCodecCtx):
 # Codec: sequence stream_data
 def encode_using_stream_data(pie, ctx: PerCodecCtx) -> None:
     encode_using_string(pie["from_username"], ctx)
+    encode_using_u64(pie["from_session"], ctx)
     encode_using_u64(pie["channel_id"], ctx)
     encode_using_bytes(pie["payload"], ctx)
 
 def decode_using_stream_data(ctx: PerCodecCtx):
     pie = {}
     pie["from_username"] = decode_using_string(ctx)
+    pie["from_session"] = decode_using_u64(ctx)
     pie["channel_id"] = decode_using_u64(ctx)
     pie["payload"] = decode_using_bytes(ctx)
     return pie

@@ -3,7 +3,7 @@
 import { CodecError, PerCodecCtx, checkOptional, setOptional, writeIntegralLE, readIntegralLE } from "../cum/cum.mjs";
 
 /**
- * CUM dynamic: max 32768 elements.
+ * CUM dynamic: max 2048 elements.
  * @typedef {Array<u8>} bytes
  */
 
@@ -36,7 +36,8 @@ export const reason_code = Object.freeze({
     SESSION_NOT_AVAILABLE: 2,
     EXPIRATION_REFRESH: 3,
     NOT_JOINED: 4,
-    NOT_AUTHENTICATED: 5
+    NOT_AUTHENTICATED: 5,
+    UNKNOWN_CHANNEL: 6
 });
 
 /**
@@ -122,6 +123,7 @@ export const challenge_type = Object.freeze({
 /**
  * @typedef {Object} stream_data
  * @property {string} from_username
+ * @property {u64} from_session
  * @property {u64} channel_id
  * @property {Array<u8>} payload
  */
@@ -211,13 +213,13 @@ export function decodeUsing_string(ctx) {
 
 // Codec: typedef bytes
 export function encodeUsing_bytes(arr, ctx) {
-    if (arr.length > 32768) throw new CodecError('bytes');
-    ctx.writeCount(32768, arr.length);
+    if (arr.length > 2048) throw new CodecError('bytes');
+    ctx.writeCount(2048, arr.length);
     for (let _i = 0; _i < arr.length; _i++) encodeUsing_u8(arr[_i], ctx);
 }
 
 export function decodeUsing_bytes(ctx) {
-    const n = ctx.readCount(32768);
+    const n = ctx.readCount(2048);
     const arr = [];
     for (let k = 0; k < n; k++) arr.push(decodeUsing_u8(ctx));
     return arr;
@@ -427,6 +429,7 @@ export function decodeUsing_leave_response(ctx) {
 // Codec: sequence stream_data
 export function encodeUsing_stream_data(pIe, ctx) {
     encodeUsing_string(pIe.from_username, ctx);
+    encodeUsing_u64(pIe.from_session, ctx);
     encodeUsing_u64(pIe.channel_id, ctx);
     encodeUsing_bytes(pIe.payload, ctx);
 }
@@ -434,6 +437,7 @@ export function encodeUsing_stream_data(pIe, ctx) {
 export function decodeUsing_stream_data(ctx) {
     const pIe = {};
     pIe.from_username = decodeUsing_string(ctx);
+    pIe.from_session = decodeUsing_u64(ctx);
     pIe.channel_id = decodeUsing_u64(ctx);
     pIe.payload = decodeUsing_bytes(ctx);
     return pIe;

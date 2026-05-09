@@ -53,11 +53,15 @@ message(STATUS "rtms_switch fetch: cum @ ${RTMS_CUM_GIT_HASH} (${rtms_deps_cum_S
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(RTMS_CUM_ROOT "${rtms_deps_cum_SOURCE_DIR}")
-set(RTMS_CUM_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../interface/rtms.cum")
+set(RTMS_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+set(RTMS_CUM_FILE "${RTMS_REPO_ROOT}/interface/rtms.cum")
 set(RTMS_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/protocol/rtms.hpp")
 set(RTMS_PY_E2E_DIR "${CMAKE_CURRENT_SOURCE_DIR}/e2e_test_py")
 set(RTMS_PROTOCOL_PY "${RTMS_PY_E2E_DIR}/rtms_protocol.py")
 set(RTMS_PY_CUM_MARKER "${RTMS_PY_E2E_DIR}/cum/cum.py")
+set(RTMS_WEB_JS_EMITTER "${RTMS_REPO_ROOT}/web_sample/scripts/cum_ast_to_js.py")
+set(RTMS_WEB_JS_OUT_V1 "${RTMS_REPO_ROOT}/web_sample/js/rtms_protocol.mjs")
+set(RTMS_WEB_JS_OUT_V2 "${RTMS_REPO_ROOT}/web_sample_v2/js/rtms_protocol.mjs")
 
 file(MAKE_DIRECTORY "${RTMS_PY_E2E_DIR}")
 
@@ -97,6 +101,23 @@ add_custom_command(
 )
 
 add_custom_target(rtms_py_generated DEPENDS "${RTMS_PROTOCOL_PY}" "${RTMS_PY_CUM_MARKER}")
+
+# web_sample / web_sample_v2: rtms_protocol.mjs from interface/rtms.cum (same as web_sample/regen_rtms_js.sh).
+add_custom_command(
+    OUTPUT "${RTMS_WEB_JS_OUT_V1}" "${RTMS_WEB_JS_OUT_V2}"
+    COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${RTMS_CUM_ROOT}/generator"
+        bash -o pipefail -c
+        "\"${Python3_EXECUTABLE}\" \"${RTMS_CUM_ROOT}/generator/cum_to_ast.py\" \"${RTMS_CUM_FILE}\" | \"${Python3_EXECUTABLE}\" \"${RTMS_WEB_JS_EMITTER}\" > \"${RTMS_WEB_JS_OUT_V1}\" && \"${Python3_EXECUTABLE}\" \"${RTMS_CUM_ROOT}/generator/cum_to_ast.py\" \"${RTMS_CUM_FILE}\" | \"${Python3_EXECUTABLE}\" \"${RTMS_WEB_JS_EMITTER}\" > \"${RTMS_WEB_JS_OUT_V2}\""
+    DEPENDS
+        "${RTMS_CUM_FILE}"
+        "${RTMS_CUM_ROOT}/generator/cum_to_ast.py"
+        "${RTMS_CUM_ROOT}/generator/ast_normalize.py"
+        "${RTMS_WEB_JS_EMITTER}"
+    COMMENT "Generating web_sample{,_v2}/js/rtms_protocol.mjs from interface/rtms.cum"
+    VERBATIM
+)
+
+add_custom_target(rtms_web_generated DEPENDS "${RTMS_WEB_JS_OUT_V1}" "${RTMS_WEB_JS_OUT_V2}")
 
 add_executable(rtms_switch
     src/main.cpp
