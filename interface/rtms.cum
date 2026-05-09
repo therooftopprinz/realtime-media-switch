@@ -1,4 +1,4 @@
-using bytes            = dynamic<u8, 2048>;
+using bytes            = dynamic<u8, 32768>;
 using session          = static<u8, 16>;
 using optional_session = optional<session>;
 

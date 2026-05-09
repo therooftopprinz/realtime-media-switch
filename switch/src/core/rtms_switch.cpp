@@ -728,15 +728,15 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
 
     if (!payload_within_limit(sd.payload.size(), ch.limits.max_payload_size))
     {
-        LOG(utils::DBG, "rtms_switch::stream_data | drop payload too large size=%zu limit=%u channel_id=%" PRIu64 " from=%s",
+        LOG(utils::WRN, "rtms_switch::stream_data | drop payload too large size=%zu limit=%u channel_id=%" PRIu64 " from=%s",
             sd.payload.size(), ch.limits.max_payload_size, static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
         return;
     }
 
     if (!stream_rate_allow(ch, ch.limits.pkt_rate_limit))
     {
-        LOG(utils::DBG, "rtms_switch::stream_data | drop rate limited limit=%u channel_id=%" PRIu64 " from=%s",
-            ch.limits.pkt_rate_limit, static_cast<std::uint64_t>(sd.channel_id), ep.c_str());
+        LOG(utils::WRN, "rtms_switch::stream_data | drop rate limited limit=%u/s channel_id=%" PRIu64 " from=%s payload_bytes=%zu",
+            ch.limits.pkt_rate_limit, static_cast<std::uint64_t>(sd.channel_id), ep.c_str(), sd.payload.size());
         return;
     }
 
@@ -746,6 +746,10 @@ void rtms_switch::handle_message(transport_endpoint_key_t const& p_transport, cu
     size_t                                                    nbytes = 0;
     if (!utils::encode_to_wire(pdu, wire, nbytes))
     {
+        LOG(utils::WRN,
+            "rtms_switch::stream_data | relay encode_per failed "
+            "(from_endpoint=%s user=%s channel=%s payload_bytes=%zu; see rtms_switch: encode_per failed above)",
+            ep.c_str(), sender->username.c_str(), ch.name.c_str(), sd.payload.size());
         return;
     }
 
@@ -786,7 +790,8 @@ void rtms_switch::on_message(transport_endpoint_key_t const& p_transport, bfc::b
     }
     catch (std::exception const&)
     {
-        LOG(utils::WRN, "rtms_switch: dropped datagram (PER decode failed)");
+        LOG(utils::WRN, "rtms_switch: dropped datagram (PER decode failed) nbytes=%zu",
+            static_cast<std::size_t>(p_payload.size()));
         return;
     }
 
@@ -808,6 +813,11 @@ void rtms_switch::on_message(transport_endpoint_key_t const& p_transport, bfc::b
         rx_sess = session_data_for_id(*pdu.session);
         if (!rx_sess)
         {
+            LOG(utils::WRN,
+                "rtms_switch::on_message | drop unknown session after PER decode nbytes=%zu is_stream_data=%d "
+                "(browser/switch codec mismatch or corrupt datagram)",
+                static_cast<std::size_t>(p_payload.size()),
+                std::holds_alternative<cum::stream_data>(pdu.message) ? 1 : 0);
             (void)try_send_ignore(p_transport, pdu, cum::reason_code::NOT_AUTHENTICATED, {});
             return;
         }

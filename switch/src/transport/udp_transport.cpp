@@ -1,16 +1,20 @@
 #include <transport/udp_transport.hpp>
 
 #include <utils/logger.hpp>
+#include <utils/transport_endpoint.hpp>
 
 #include <bfc/buffer.hpp>
 #include <bfc/socket.hpp>
 
 #include <array>
 #include <arpa/inet.h>
-#include <cstring>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -163,6 +167,12 @@ udp_transport::udp_transport(udp_transport_config_t const& p_config, utils::io_r
     int opt = 1;
     m_socket.set_sock_opt(SOL_SOCKET, SO_REUSEADDR, opt);
 
+    // WebSocket relays can deliver many large RTMS UDPs back-to-back (~5–20 KiB each at 30 Hz).
+    // The default SO_RCVBUF is tiny; when it fills, Linux drops datagrams silently — tcpdump still
+    // shows loopback ingress while the application never recv()s those packets.
+    constexpr int recv_buf_request = 8 * 1024 * 1024;
+    (void)m_socket.set_sock_opt(SOL_SOCKET, SO_RCVBUF, recv_buf_request);
+
     if (m_transport_ipv6)
     {
         int v6only = 0;
@@ -181,6 +191,12 @@ udp_transport::udp_transport(udp_transport_config_t const& p_config, utils::io_r
         {
             throw std::runtime_error("udp_transport: bind failed");
         }
+    }
+
+    int const fl = fcntl(m_socket.fd(), F_GETFL, 0);
+    if (fl != -1)
+    {
+        (void)fcntl(m_socket.fd(), F_SETFL, fl | O_NONBLOCK);
     }
 }
 
@@ -243,36 +259,52 @@ void udp_transport::on_queue_input_available()
 void udp_transport::on_socket_available()
 {
     std::array<char, 65536> buf{};
-    sockaddr_storage        addr{};
-    socklen_t               addr_len = sizeof(addr);
+    bool pushed_any = false;
 
-    ssize_t const n =
-        m_socket.recv(buf, 0, reinterpret_cast<sockaddr*>(&addr), &addr_len);
-    if (n <= 0)
+    // Drain the kernel RX queue: epoll may deliver one readiness edge while many datagrams are queued.
+    // Without a loop, bursty relay traffic leaves packets unconsumed until the socket buffer overflows.
+    for (;;)
     {
+        sockaddr_storage addr{};
+        socklen_t        addr_len = sizeof(addr);
+
+        ssize_t const n =
+            m_socket.recv(buf, MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&addr), &addr_len);
         if (n < 0)
         {
-            LOG(utils::WRN, "udp_transport: recvfrom error");
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                break;
+            }
+            LOG(utils::WRN, "udp_transport: recvfrom error errno=%d (%s)", errno, std::strerror(errno));
+            break;
         }
-        return;
+        if (n == 0)
+        {
+            break;
+        }
+
+        sockaddr_storage const peer_norm = normalize_peer_for_transport(addr, m_transport_ipv6);
+
+        if (m_transport_ipv6)
+        {
+            m_rx_queue.push(transport6_data_s{reinterpret_cast<sockaddr_in6 const&>(peer_norm), buffer_from_view(
+                bfc::const_buffer_view(
+                    reinterpret_cast<std::byte const*>(buf.data()), static_cast<size_t>(n)))});
+        }
+        else
+        {
+            m_rx_queue.push(transport4_data_s{reinterpret_cast<sockaddr_in const&>(peer_norm), buffer_from_view(
+                bfc::const_buffer_view(
+                    reinterpret_cast<std::byte const*>(buf.data()), static_cast<size_t>(n)))});
+        }
+        pushed_any = true;
     }
 
-    sockaddr_storage const peer_norm = normalize_peer_for_transport(addr, m_transport_ipv6);
-
-    if (m_transport_ipv6)
+    if (pushed_any)
     {
-        m_rx_queue.push(transport6_data_s{reinterpret_cast<sockaddr_in6 const&>(peer_norm), buffer_from_view(
-            bfc::const_buffer_view(
-                reinterpret_cast<std::byte const*>(buf.data()), static_cast<size_t>(n)))});
+        m_cv_reactor.wake_up();
     }
-    else
-    {
-        m_rx_queue.push(transport4_data_s{reinterpret_cast<sockaddr_in const&>(peer_norm), buffer_from_view(
-            bfc::const_buffer_view(
-                reinterpret_cast<std::byte const*>(buf.data()), static_cast<size_t>(n)))});
-    }
-
-    m_cv_reactor.wake_up();
 }
 
 void udp_transport::start()

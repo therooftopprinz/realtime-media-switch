@@ -11,7 +11,7 @@ from cum.cum import CodecError, PerCodecCtx, check_optional, set_optional, read_
 u8 = u16 = u32 = u64 = int
 
 bytes = list[u8]  # CUM using bytes
-# CUM dynamic sequence: at most 2048 elements.
+# CUM dynamic sequence: at most 32768 elements.
 
 session = list[u8]  # fixed len '16'  # CUM using session
 # CUM static array: fixed length '16' (not emitted separately in Python).
@@ -217,13 +217,13 @@ def decode_using_string(ctx: PerCodecCtx) -> str:
     return ctx.decode_c_string_latin1()
 
 def encode_using_bytes(obj, ctx: PerCodecCtx) -> None:
-    if len(obj) > 2048: raise CodecError('bytes')
-    ctx.write_count(2048, len(obj))
+    if len(obj) > 32768: raise CodecError('bytes')
+    ctx.write_count(32768, len(obj))
     for it in obj:
         encode_using_u8(it, ctx)
 
 def decode_using_bytes(ctx: PerCodecCtx):
-    n = ctx.read_count(2048)
+    n = ctx.read_count(32768)
     arr = []
     for _ in range(n):
         arr.append(decode_using_u8(ctx))

@@ -1,0 +1,19 @@
+# Build outputs
+build_*/
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local logs and traces
+*.log
+*_strace.txt
+
+# Local command scratch files
+cmd*.txt

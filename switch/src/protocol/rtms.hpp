@@ -12,7 +12,7 @@ namespace cum
 /
 ************************************************/
 
-using bytes = cum::vector<u8, 2048>;
+using bytes = cum::vector<u8, 32768>;
 using session = cum::array<u8, 16>;
 using optional_session = std::optional<session>;
 enum status_code
@@ -997,10 +997,6 @@ inline void decode_per(rtms& pIe, cum::per_codec_ctx& pCtx)
         pIe.session = decltype(pIe.session)::value_type{};
         decode_per(*pIe.session, pCtx);
     }
-    else
-    {
-        pIe.session = std::nullopt;
-    }
     decode_per(pIe.message, pCtx);
 }
 
@@ -1016,16 +1012,13 @@ inline void str(const char* pName, const rtms& pIe, std::string& pCtx, bool pIsL
         pCtx = pCtx + "\"" + pName + "\":{";
     }
     size_t nOptional = 0;
-    if (pIe.session)
-    {
-        ++nOptional;
-    }
+    if (pIe.session) nOptional++;
     size_t nMandatory = 3;
     str("protocol_version", pIe.protocol_version, pCtx, !(--nMandatory+nOptional));
     str("sender_ts_us", pIe.sender_ts_us, pCtx, !(--nMandatory+nOptional));
     if (pIe.session)
     {
-        str("session", *pIe.session, pCtx, !(nMandatory + --nOptional));
+        str("session", *pIe.session, pCtx, !(nMandatory+--nOptional));
     }
     str("message", pIe.message, pCtx, !(--nMandatory+nOptional));
     pCtx = pCtx + "}";

@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RTMS Demo v2</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+    }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f1419;
+      color: #e6edf3;
+      display: flex;
+      flex-direction: column;
+    }
+    a { color: #7aa2ff; }
+    .toast {
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      max-width: 360px;
+      padding: 10px 14px;
+      background: #1c2430;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 9999;
+      box-shadow: 0 4px 24px rgba(0,0,0,.4);
+    }
+    #loginPanel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 24px;
+    }
+    .login-card {
+      max-width: 420px;
+      width: 100%;
+      padding: 24px;
+      background: #161b22;
+      border-radius: 12px;
+      border: 1px solid #30363d;
+    }
+    #loginPanel h1 { margin-top: 0; font-size: 1.25rem; font-weight: 600; text-align: center; }
+    .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+    label.small { font-size: 11px; color: #8b949e; }
+    input, select, textarea, button {
+      font: inherit;
+      border-radius: 6px;
+      border: 1px solid #30363d;
+      background: #0d1117;
+      color: #e6edf3;
+      padding: 8px 10px;
+    }
+    button {
+      cursor: pointer;
+      background: #238636;
+      border-color: #238636;
+      color: #fff;
+      font-weight: 500;
+    }
+    button.secondary { background: #21262d; border-color: #30363d; color: #c9d1d9; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #mainPanel {
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+    #mainPanel.visible { display: flex; }
+    #statusBar {
+      flex-shrink: 0;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-family: ui-monospace, monospace;
+      border-bottom: 1px solid #30363d;
+      background: #161b22;
+    }
+    .led { width: 10px; height: 10px; border-radius: 50%; background: #da3633; display: inline-block; }
+    .led.ok { background: #3fb950; }
+    #layout {
+      flex: 1;
+      display: flex;
+      flex-direction: row;
+      align-items: stretch;
+      min-height: 0;
+      min-width: 0;
+    }
+    #leftPane,
+    #workspace {
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      background: #0d1117;
+      padding: 8px;
+    }
+    #leftPane {
+      flex: 0 0 200px;
+      width: 200px;
+      border-right: 1px solid #30363d;
+    }
+    #workspace {
+      flex: 1 1 auto;
+      min-width: 200px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #splitWsRp {
+      flex: 0 0 6px;
+      width: 6px;
+      cursor: col-resize;
+      background: #161b22;
+      border-left: 1px solid #30363d;
+      border-right: 1px solid #30363d;
+      align-self: stretch;
+      min-height: 0;
+    }
+    #splitWsRp:hover,
+    #splitWsRp:focus-visible {
+      background: #21262d;
+    }
+    body.split-dragging {
+      cursor: col-resize;
+      user-select: none;
+    }
+    #rightPane {
+      flex: 0 0 280px;
+      width: 280px;
+      min-width: 220px;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      align-items: stretch;
+      overflow-x: hidden;
+      overflow-y: hidden;
+      background: #0d1117;
+      padding: 8px;
+    }
+    #wsToolbar {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    #videoScroll {
+      flex: 0 0 auto;
+    }
+    #tileGrid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      align-content: start;
+    }
+    #tileGrid.maximized {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .tile {
+      position: relative;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      min-height: 140px;
+      cursor: pointer;
+      border: 2px solid transparent;
+    }
+    .tile.activeMax { border-color: #58a6ff; }
+    .tile.maxMain {
+      min-height: 55vh;
+      flex: 0 0 auto;
+    }
+    .tileRow {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      min-height: 120px;
+    }
+    .tileRow .tile { flex: 0 0 200px; min-width: 160px; min-height: 120px; }
+    .tile canvas { display: block; width: 100%; height: auto; max-height: 280px; object-fit: contain; }
+    .tile-caption {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 4px 8px;
+      font-size: 11px;
+      background: rgba(0,0,0,.65);
+    }
+    .ch-tab {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px;
+      margin-bottom: 4px;
+      border-radius: 6px;
+      background: #161b22;
+      cursor: pointer;
+      border: 1px solid transparent;
+      font-size: 13px;
+      text-align: left;
+      color: inherit;
+      width: 100%;
+    }
+    .ch-tab:hover { border-color: #30363d; }
+    .ch-tab.focused { border-color: #58a6ff; background: #1c2128; }
+    .lp-heading {
+      font-size: 11px;
+      font-weight: 600;
+      color: #8b949e;
+      text-transform: none;
+      margin: 0 0 6px 0;
+    }
+    .saved-ch-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 4px;
+      border-radius: 6px;
+      background: #161b22;
+      border: 1px solid transparent;
+      font-size: 13px;
+      min-height: 36px;
+    }
+    .saved-ch-row:hover { border-color: #30363d; }
+    .saved-ch-name {
+      flex: 1;
+      min-width: 0;
+      text-align: left;
+      padding: 8px 10px;
+      background: none;
+      border: none;
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
+    }
+    .saved-ch-name:hover { color: #58a6ff; }
+    .saved-ch-row .saved-ch-del {
+      margin-left: auto;
+      flex-shrink: 0;
+      padding: 4px 8px;
+      background: #21262d;
+      border-radius: 4px;
+      font-size: 11px;
+      border: none;
+      color: #f85149;
+      cursor: pointer;
+    }
+    .saved-ch-empty { font-size: 12px; color: #6e7681; padding: 4px 0 8px; }
+    .ch-tab .x {
+      margin-left: auto;
+      padding: 2px 8px;
+      background: #21262d;
+      border-radius: 4px;
+      font-size: 11px;
+      border: none;
+      color: #f85149;
+      cursor: pointer;
+    }
+    #chat {
+      flex: 1 1 0;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 13px;
+      margin: 8px 0;
+      background: #0d1117;
+    }
+    .bubble { margin: 6px 0; }
+    .bubble .meta { font-size: 11px; color: #8b949e; margin-bottom: 2px; }
+    .bubble .meta .chat-ts {
+      color: #6e7681;
+      font-variant-numeric: tabular-nums;
+      margin-left: 6px;
+    }
+    .bubble > div:not(.meta) {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #muteList { flex-shrink: 0; font-size: 12px; margin-bottom: 8px; }
+    #muteList label { display: flex; align-items: center; gap: 8px; margin: 4px 0; cursor: pointer; }
+    dialog {
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 16px;
+      background: #161b22;
+      color: #e6edf3;
+      max-width: 96vw;
+    }
+    dialog::backdrop { background: rgba(0,0,0,.5); }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+    #rightPane .rp-chat-bar {
+      flex-shrink: 0;
+      width: 100%;
+    }
+    #chatInput {
+      flex: 1;
+      min-width: 0;
+      resize: none;
+      line-height: 1.35;
+      padding: 6px 10px;
+      overflow-y: hidden;
+    }
+    .rp-io { flex-shrink: 0; margin-bottom: 8px; }
+    .rp-io-row { margin-bottom: 10px; }
+    .rp-io-row:last-child { margin-bottom: 0; }
+    .rp-io-line {
+      display: flex;
+      gap: 6px;
+      align-items: stretch;
+    }
+    .rp-io-line select {
+      flex: 1;
+      min-width: 0;
+    }
+    button.stream-tog {
+      width: 100%;
+      text-align: left;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      align-items: flex-start;
+      border-radius: 8px;
+      border: 1px solid #30363d;
+      background: #21262d;
+      color: #8b949e;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    button.stream-tog.compact {
+      width: auto;
+      min-width: 56px;
+      flex: 0 0 auto;
+      padding: 6px 8px;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      font-size: 12px;
+    }
+    button.stream-tog .tog-hint {
+      font-size: 11px;
+      font-weight: 400;
+      color: #6e7681;
+    }
+    button.stream-tog.compact .tog-hint {
+      font-weight: 600;
+      color: inherit;
+    }
+    button.stream-tog.on {
+      background: #0d2818;
+      border-color: #238636;
+      color: #d8eee0;
+    }
+    button.stream-tog.on .tog-hint { color: #8ddb9a; }
+  </style>
+</head>
+<body>
+  <div id="toastRoot"></div>
+
+  <div id="loginPanel">
+    <div class="login-card">
+    <h1>RTMS Demo</h1>
+    <div class="field">
+      <label class="small" for="username">Username</label>
+      <input id="username" type="text" autocomplete="username" />
+    </div>
+    <div class="field">
+      <label class="small" for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" />
+    </div>
+    <div class="field">
+      <label class="small" for="savedUsers">Saved logins</label>
+      <select id="savedUsers">
+        <option value="">(none)</option>
+      </select>
+    </div>
+    <button type="button" class="secondary" id="btnDeleteSaved" style="margin-bottom:8px;">Delete Saved</button>
+    <button type="button" id="btnLogin">Connect</button>
+    <p class="small" style="color:#8b949e;font-size:12px;margin-top:12px;">Uses RTMS identity over WebSocket (no cookies).</p>
+    </div>
+  </div>
+
+  <div id="mainPanel">
+    <div id="statusBar">
+      <span id="stLed" class="led" title="WebSocket"></span>
+      <span id="stWs">offline</span>
+      <span>|</span>
+      <span id="stUser" title="Logged-in user">—</span>
+      <span>|</span>
+      <span id="stRtt">—</span> ms
+      <span>|</span>
+      <span id="stDl">0</span> kbps DL
+      <span>|</span>
+      <span id="stUl">0</span> kbps UL
+      <span>|</span>
+      <span id="stR">0</span> ch
+      <span>|</span>
+      <span id="stS">0</span> streams
+    </div>
+    <div id="layout">
+      <aside id="leftPane">
+        <button type="button" id="btnJoin">Join channel</button>
+        <div style="margin-top:12px;">
+          <div class="lp-heading">Saved channels</div>
+          <div id="savedChannelList"></div>
+        </div>
+        <div style="margin-top:12px;">
+          <div class="lp-heading">Joined channels</div>
+          <div id="channelTabs"></div>
+        </div>
+      </aside>
+      <main id="workspace">
+        <div id="wsToolbar">
+          <button type="button" class="secondary" id="btnDisc" title="Close WebSocket">Disconnect</button>
+          <button type="button" class="secondary" id="btnZoomIn" title="Fewer columns">Zoom +</button>
+          <button type="button" class="secondary" id="btnZoomOut" title="More columns">Zoom −</button>
+          <span id="colLabel" style="font-size:12px;color:#8b949e">cols: 2</span>
+        </div>
+        <div id="videoScroll">
+          <div id="tileGrid"></div>
+        </div>
+      </main>
+      <div
+        id="splitWsRp"
+        class="pane-gutter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Drag to resize workspace and right panel"
+        tabindex="0"
+        title="Drag to resize"
+      ></div>
+      <aside id="rightPane">
+        <div class="rp-io">
+          <div class="rp-io-row field" style="margin-bottom:10px;">
+            <label class="small" for="selV">Video input</label>
+            <div class="rp-io-line">
+              <select id="selV"></select>
+              <button type="button" class="stream-tog compact on" id="togSendVideo" aria-pressed="true" title="Send video to joined channels">
+                <span class="tog-hint">On</span>
+              </button>
+            </div>
+          </div>
+          <div class="rp-io-row field" style="margin-bottom:10px;">
+            <label class="small" for="selA">Audio input</label>
+            <div class="rp-io-line">
+              <select id="selA"></select>
+              <button type="button" class="stream-tog compact on" id="togSendAudio" aria-pressed="true" title="Send audio to joined channels">
+                <span class="tog-hint">On</span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="muteList"><strong>Muted channels</strong> (still receive)</div>
+        <div id="chat"></div>
+        <div class="row rp-chat-bar" style="margin-top:auto;">
+          <textarea id="chatInput" rows="1" title="Enter: send · Shift+Enter: new line" placeholder="Message (focused channel)"></textarea>
+          <button type="button" id="btnSend">Send</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <dialog id="dlgJoin">
+    <h3 style="margin-top:0;">Join channel</h3>
+    <div class="field">
+      <label class="small" for="jName">Channel name</label>
+      <input id="jName" type="text" required />
+    </div>
+    <div class="field">
+      <label class="small" for="jPass">Password</label>
+      <input id="jPass" type="password" />
+    </div>
+    <div class="row" style="justify-content:flex-end;margin-top:12px;">
+      <button type="button" class="secondary" id="jCancel">Cancel</button>
+      <button type="button" id="jOk">OK</button>
+    </div>
+  </dialog>
+
+  <script>
+    window.RTMS_BASE_URL = __BASE_URL__;
+  </script>
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>
