@@ -190,17 +190,23 @@ export function decodeUsing_u32(ctx) {
 }
 
 export function encodeUsing_u64(v, ctx) {
-    const vv = Number(BigInt.asUintN(64, BigInt(v)));
+    let vv = BigInt.asUintN(64, BigInt(v));
     if (ctx.remaining() < 8) throw new CodecError('encode buffer full');
-    writeIntegralLE(ctx.buf, ctx.off, vv, 8);
+    for (let b = 0; b < 8; b++) {
+        ctx.buf[ctx.off + b] = Number(vv & 0xffn);
+        vv >>= 8n;
+    }
     ctx.off += 8;
 }
 
 export function decodeUsing_u64(ctx) {
     if (ctx.remaining() < 8) throw new CodecError('decode overrun');
-    const v = readIntegralLE(ctx.buf, ctx.off, 8);
+    let v = 0n;
+    for (let b = 0; b < 8; b++) {
+        v |= BigInt(ctx.buf[ctx.off + b]) << BigInt(8 * b);
+    }
     ctx.off += 8;
-    return v;
+    return BigInt.asUintN(64, v);
 }
 
 export function encodeUsing_string(v, ctx) {

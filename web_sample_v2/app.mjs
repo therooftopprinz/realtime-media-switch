@@ -556,6 +556,12 @@ async function ensureOpusRing(key, focusLinear) {
   }
   const p = (async () => {
     ensureAudioCtx();
+    // Receive-only (no mic/cam send) never runs startCapture() → context stays suspended → silence.
+    if (actx.state === "suspended") {
+      try {
+        await actx.resume();
+      } catch (_) {}
+    }
     const gain = actx.createGain();
     gain.gain.value = focusLinear;
     gain.connect(master);
@@ -624,10 +630,11 @@ function decodeOpusPacket(key, data, ts) {
   const o = opusDec.get(key);
   if (!o) return;
   try {
+    // Duration is inferred from the Opus packet; a fixed 5 ms value breaks decode if the encoder
+    // or network yields a different frame size.
     const chunk = new EncodedAudioChunk({
       type: "key",
       timestamp: ts,
-      duration: OPUS_FRAME_DURATION_US,
       data,
     });
     o.dec.decode(chunk);
@@ -1690,20 +1697,19 @@ async function maybeStartEncoders() {
     const ctx = ensureAudioCtx();
     if (ctx.state === "suspended") await ctx.resume();
     const src = ctx.createMediaStreamSource(new MediaStream([atrack]));
-    let monoNode = src;
-    if ((atrack.getSettings?.().channelCount || 0) > OPUS_CHANNELS) {
-      const merger = ctx.createChannelMerger(OPUS_CHANNELS);
-      src.connect(merger, 0, 0);
-      monoNode = merger;
-    }
     const dest = ctx.createMediaStreamDestination();
-    // channelCount on dest defaults to 2; force mono to match encoder config.
+    // Force a single channel into MediaStreamDestination. Relying on dest.channelCount = 1 is
+    // flaky across browsers; a stereo graph yields stereo AudioData and the Opus encoder never
+    // configures (we require mono). Split input to 2 taps, take channel 0 only → mono track.
+    const splitter = ctx.createChannelSplitter(2);
+    const monoMerger = ctx.createChannelMerger(1);
+    src.connect(splitter);
+    splitter.connect(monoMerger, 0, 0);
     try {
       dest.channelCount = OPUS_CHANNELS;
       dest.channelCountMode = "explicit";
-      dest.channelInterpretation = "speakers";
     } catch (_) {}
-    monoNode.connect(dest);
+    monoMerger.connect(dest);
     resampledAudioStream = dest.stream;
     const procTrack = dest.stream.getAudioTracks()[0] || atrack;
 
@@ -1722,6 +1728,9 @@ async function maybeStartEncoders() {
     });
 
     let aConfigured = false;
+    let opusSkipLogged = false;
+    /** Sample rate passed to AudioEncoder.configure (must match each encoded AudioData). */
+    let opusEncSampleRate = 0;
     const reader = aReader;
     const enc = aEncoder;
     const encLoopA = async () => {
@@ -1737,27 +1746,53 @@ async function maybeStartEncoders() {
         try {
           if (enc === aEncoder) {
             if (!aConfigured) {
-              const sr = OPUS_RATES.has(value.sampleRate) ? value.sampleRate : OPUS_SAMPLE_RATE;
-              const ch = Math.max(1, Math.min(2, value.numberOfChannels || OPUS_CHANNELS));
-              try {
-                await enc.configure({
-                  codec: "opus",
-                  sampleRate: sr,
-                  numberOfChannels: ch,
-                  bitrate: 64000,
-                  opus: { frameDuration: OPUS_FRAME_DURATION_US },
-                });
-              } catch (_) {
-                await enc.configure({
-                  codec: "opus",
-                  sampleRate: sr,
-                  numberOfChannels: ch,
-                  bitrate: 64000,
-                });
+              // Must stay mono; rate must match real AudioData or encode() fails silently every frame.
+              if (
+                OPUS_RATES.has(value.sampleRate) &&
+                value.numberOfChannels === OPUS_CHANNELS
+              ) {
+                opusEncSampleRate = value.sampleRate;
+                // Must stay mono: ensureOpusRing / AudioDecoder is configured with numberOfChannels: 1.
+                try {
+                  await enc.configure({
+                    codec: "opus",
+                    sampleRate: opusEncSampleRate,
+                    numberOfChannels: OPUS_CHANNELS,
+                    bitrate: 64000,
+                    opus: {
+                      format: "opus",
+                      frameDuration: OPUS_FRAME_DURATION_US,
+                    },
+                  });
+                } catch (_) {
+                  await enc.configure({
+                    codec: "opus",
+                    sampleRate: opusEncSampleRate,
+                    numberOfChannels: OPUS_CHANNELS,
+                    bitrate: 64000,
+                    opus: { format: "opus" },
+                  });
+                }
+                aConfigured = true;
+              } else if (!opusSkipLogged) {
+                opusSkipLogged = true;
+                console.warn(
+                  "AudioEncoder: need mono + Opus rate 8/12/16/24/48 kHz (got",
+                  value.sampleRate,
+                  "Hz,",
+                  value.numberOfChannels,
+                  "ch) — check mic / graph",
+                );
               }
-              aConfigured = true;
             }
-            if (enc.state === "configured") enc.encode(value);
+            if (
+              aConfigured &&
+              enc.state === "configured" &&
+              value.sampleRate === opusEncSampleRate &&
+              value.numberOfChannels === OPUS_CHANNELS
+            ) {
+              enc.encode(value);
+            }
           }
         } catch (e) {
           console.warn("AudioEncoder encode", e);
@@ -1889,6 +1924,8 @@ function bindUi() {
       $("loginPanel").style.display = "none";
       $("mainPanel").classList.add("visible");
       $("stUser").textContent = selfName || "—";
+      ensureAudioCtx();
+      void actx?.resume().catch(() => {});
       populateDevices().catch(console.warn);
       requestAnimationFrame(() => {
         requestAnimationFrame(() => applyRpWidth(rpWidthPx));
