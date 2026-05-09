@@ -182,9 +182,32 @@ function clampRpWidth(w) {
   return Math.min(maxRpWidth(), Math.max(MIN_RP_W, Math.round(w)));
 }
 
+/** Matches `max-width` breakpoint in `index.html` for stacked mobile layout. */
+function isCompactLayout() {
+  return (
+    typeof globalThis.matchMedia === "function" &&
+    globalThis.matchMedia("(max-width: 719px)").matches
+  );
+}
+
+/** Keep a sane stored width when the narrow layout does not apply desktop clamping. */
+function softClampRpWish(w) {
+  const n = Math.round(Number(w));
+  if (!Number.isFinite(n)) return DEFAULT_RP_W;
+  return Math.max(MIN_RP_W, Math.min(640, n));
+}
+
 function applyRpWidth(w) {
   const rp = /** @type {HTMLElement | null} */ ($("rightPane"));
   if (!rp) return;
+  if (isCompactLayout()) {
+    rpWidthPx = softClampRpWish(w);
+    rp.style.flex = "";
+    rp.style.width = "";
+    rp.style.minWidth = "";
+    requestAnimationFrame(() => fitChatTextarea());
+    return;
+  }
   rpWidthPx = clampRpWidth(w);
   rp.style.flex = `0 0 ${rpWidthPx}px`;
   rp.style.width = `${rpWidthPx}px`;
@@ -192,6 +215,15 @@ function applyRpWidth(w) {
     localStorage.setItem(RP_W_STORAGE, String(rpWidthPx));
   } catch (_) {}
   requestAnimationFrame(() => fitChatTextarea());
+}
+
+function syncResponsiveLayout() {
+  applyRpWidth(rpWidthPx);
+  if (isCompactLayout() && colCount > 2) {
+    setCols(2);
+  } else {
+    setCols(colCount);
+  }
 }
 
 function loadStoredRpWidth() {
@@ -209,7 +241,8 @@ function initPanelResize() {
   const split = $("splitWsRp");
   if (!split) return;
 
-  applyRpWidth(loadStoredRpWidth());
+  rpWidthPx = loadStoredRpWidth();
+  syncResponsiveLayout();
 
   // Splitter is the workspace/right-pane boundary. Moving it right (+Δx) grows the
   // workspace and narrows the right pane, so RP width changes by −Δx (LTR).
@@ -242,8 +275,12 @@ function initPanelResize() {
   });
 
   window.addEventListener("resize", () => {
-    applyRpWidth(rpWidthPx);
+    syncResponsiveLayout();
   });
+  const mq = globalThis.matchMedia?.("(max-width: 719px)");
+  if (mq?.addEventListener) {
+    mq.addEventListener("change", () => syncResponsiveLayout());
+  }
 }
 
 function getBase() {
@@ -1889,7 +1926,8 @@ async function leaveChannel(id) {
 }
 
 function setCols(n) {
-  colCount = Math.max(2, Math.min(8, n));
+  const minCols = isCompactLayout() ? 1 : 2;
+  colCount = Math.max(minCols, Math.min(8, n));
   $("tileGrid").style.gridTemplateColumns = `repeat(${colCount}, 1fr)`;
   $("colLabel").textContent = `cols: ${colCount}`;
 }
@@ -1928,7 +1966,7 @@ function bindUi() {
       void actx?.resume().catch(() => {});
       populateDevices().catch(console.warn);
       requestAnimationFrame(() => {
-        requestAnimationFrame(() => applyRpWidth(rpWidthPx));
+        requestAnimationFrame(() => syncResponsiveLayout());
       });
     };
     client.onIdentityFailed = async () => {
@@ -2106,6 +2144,6 @@ async function doScreenShare() {
 bindUi();
 initPanelResize();
 startVideoTileIdleSweep();
-setCols(2);
+setCols(isCompactLayout() ? 1 : 2);
 updateTransmitToggleHint($("togSendVideo"));
 updateTransmitToggleHint($("togSendAudio"));
